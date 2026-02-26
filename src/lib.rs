@@ -1,0 +1,1103 @@
+//! # LuZe - Luhmann's Zettelkasten
+//!
+//! A digital note box inspired by Niklas Luhmann's Zettelkasten system: an organic, tree-structured
+//! knowledge organization with the following properties:
+//!
+//! - Fixed positions prevent rigid categorization — a note's ID encodes its place in the tree
+//! - A keyword search serves as entry point
+//! - Changes become new branches from the relevant note
+//! - Links and indices can change when necessary (small fixes, rephrasing, git merges)
+//! - Main box only: raw thoughts and insights (~90,000 notes for Luhmann)
+//! - Updates push old content down the tree as archived children, keeping history                                                                                                                                                 
+//! - Notes can be removed, but should almost never be required
+//! - Notes are stored as JSON in per-drawer files, lazily loaded       
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::{collections::HashSet, fmt, fs, io, path::{Path, PathBuf}};
+
+mod json {
+    use serde::{Serialize, de::DeserializeOwned};
+
+    pub fn to_string_pretty<T: Serialize>(value: &T) -> Result<String, String> {
+        #[cfg(feature = "sonic-rs")]
+        { sonic_rs::to_string_pretty(value).map_err(|e| e.to_string()) }
+        #[cfg(feature = "serde-json")]
+        { serde_json::to_string_pretty(value).map_err(|e| e.to_string()) }
+    }
+
+    pub fn from_str<T: DeserializeOwned>(s: &str) -> Result<T, String> {
+        #[cfg(feature = "sonic-rs")]
+        { sonic_rs::from_str(s).map_err(|e| e.to_string()) }
+        #[cfg(feature = "serde-json")]
+        { serde_json::from_str(s).map_err(|e| e.to_string()) }
+    }
+}
+
+/// Strips one Luhmann segment from the end of `s`.
+/// Returns `s` unchanged if `s` is already a root (single segment).
+fn luhmann_parent_str(s: &str) -> &str {
+    if s.is_empty() { return s; }
+    let is_digit = s.as_bytes().last().unwrap().is_ascii_digit();
+    let seg_start = s.rfind(|c: char| c.is_ascii_digit() != is_digit)
+        .map_or(0, |i| i + 1);
+    if seg_start == 0 { s } else { &s[..seg_start] }
+}
+
+/// Compares two Luhmann IDs (no `/`) segment by segment with numeric ordering.
+fn cmp_luhmann(mut a: &str, mut b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    loop {
+        match (a.is_empty(), b.is_empty()) {
+            (true, true) => return Ordering::Equal,
+            (true, _)    => return Ordering::Less,
+            (_, true)    => return Ordering::Greater,
+            _            => {}
+        }
+        let a_digit = a.as_bytes()[0].is_ascii_digit();
+        let b_digit = b.as_bytes()[0].is_ascii_digit();
+        let a_end = a.find(|c: char| c.is_ascii_digit() != a_digit).unwrap_or(a.len());
+        let b_end = b.find(|c: char| c.is_ascii_digit() != b_digit).unwrap_or(b.len());
+        let ord = if a_digit && b_digit {
+            let an: u32 = a[..a_end].parse().unwrap();
+            let bn: u32 = b[..b_end].parse().unwrap();
+            an.cmp(&bn)
+        } else {
+            a[..a_end].cmp(&b[..b_end])
+        };
+        match ord {
+            Ordering::Equal => { a = &a[a_end..]; b = &b[b_end..]; }
+            other           => return other,
+        }
+    }
+}
+
+fn luhmann_next_child(s: &str) -> String {
+    let i = s.rfind(|c: char| !c.is_ascii_digit()).map_or(0, |i| i + 1);
+    if i == s.len() { format!("{s}1") }
+    else { let n: u32 = s[i..].parse().unwrap(); format!("{}{}", &s[..i], n + 1) }
+}
+
+fn luhmann_next_sibling(s: &str) -> String {
+    let i = s.rfind(|c: char| c.is_ascii_digit()).map_or(0, |i| i + 1);
+    if i < s.len() {
+        let mut b = s.as_bytes().to_vec();
+        *b.last_mut().unwrap() += 1;
+        String::from_utf8(b).unwrap()
+    } else {
+        format!("{s}a")
+    }
+}
+
+/// A single note (slip) in the box.
+///
+/// Each note has a unique hierarchical [`ID`], freeform text content,
+/// and a list of links to other notes. The first link is always the parent note.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Note {
+    id: ID,
+    content: String,
+    links: Vec<ID>,  // first entry is always the parent
+    created_at: DateTime<Utc>,
+}
+
+impl Note {
+    /// Creates a new Note with the given `id`, `parent` ID, and `content`.
+    ///
+    /// The parent is recorded as the first entry in `links`.
+    pub fn new(id: impl Into<ID>, parent: impl Into<ID>, content: &str) -> Self {
+        Note {
+            id: id.into(),
+            content: content.into(),
+            links: vec![parent.into()],
+            created_at: Utc::now(),
+        }
+    }
+
+    pub fn id(&self) -> &ID { &self.id }
+    pub fn content(&self) -> &str { &self.content }
+    pub fn created_at(&self) -> &DateTime<Utc> { &self.created_at }
+    /// Returns the parent ID (first link), if any.
+    pub fn parent(&self) -> Option<&ID> { self.links.first() }
+    pub fn links(&self) -> &[ID] { &self.links }
+
+    pub fn set_content(&mut self, content: &str) { self.content = content.into(); }
+    pub fn add_link(&mut self, id: impl Into<ID>) { self.links.push(id.into()); }
+    /// Returns a clone of this note with a different ID.
+    pub fn with_id(mut self, id: impl Into<ID>) -> Self { self.id = id.into(); self }
+    /// Removes the first occurrence of `id` from links. Returns `true` if found.
+    pub fn remove_link(&mut self, id: &ID) -> bool {
+        if let Some(pos) = self.links.iter().position(|l| l == id) {
+            self.links.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// A hierarchical Luhmann-style ID encoding a note's position in the tree.
+///
+/// IDs alternate between numeric and alphabetic segments, e.g. `1a1b2`.
+/// This makes the parent–child relationship unambiguous without separators:
+/// appending a letter to a number (or a number to a letter) signals a new child level.
+///
+/// ```text
+/// 1
+/// ├── 1a          (first child branch of 1)
+/// │   ├── 1a1     (first child of 1a)
+/// │   │   └── 1a1b  (first child branch of 1a1)
+/// │   └── 1a2     (second child of 1a)
+/// └── 1b          (next sibling branch after 1a)
+/// ```
+///
+/// IDs serialize as plain strings (`"1a1b2"`) and compare with proper numeric
+/// ordering, so `9 < 10` within a segment.
+#[derive(Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ID(String);
+
+impl ID {
+    /// Returns the root ID of the main NoteBox box: `ZK1`.
+    pub fn root(id: &str) -> Self { ID(id.into()) }
+
+    /// Returns the next child ID by incrementing the trailing numeric segment,
+    /// or appending `1` if the ID ends with a letter segment.
+    /// Operates on the last `/`-section; the section prefix is preserved.
+    ///
+    /// | Input      | Output    | Meaning               |
+    /// |------------|-----------|-----------------------|
+    /// | `1a`       | `1a1`     | first child of `1a`   |
+    /// | `1c2/1a`   | `1c2/1a1` | first child of `1c2/1a` |
+    pub fn next_child(&self) -> Self {
+        match self.0.rfind('/') {
+            Some(slash) => ID(format!("{}/{}", &self.0[..slash],
+                                      luhmann_next_child(&self.0[slash + 1..]))),
+            None        => ID(luhmann_next_child(&self.0)),
+        }
+    }
+
+    /// Returns the next sibling ID by incrementing the trailing letter segment,
+    /// or appending `a` if the ID ends with a numeric segment.
+    /// Operates on the last `/`-section; the section prefix is preserved.
+    ///
+    /// | Input      | Output    | Meaning                     |
+    /// |------------|-----------|-----------------------------|
+    /// | `1`        | `1a`      | first child branch of `1`   |
+    /// | `1c2/1a`   | `1c2/1b`  | next branch in section      |
+    pub fn next_sibling(&self) -> Self {
+        match self.0.rfind('/') {
+            Some(slash) => ID(format!("{}/{}", &self.0[..slash],
+                                      luhmann_next_sibling(&self.0[slash + 1..]))),
+            None        => ID(luhmann_next_sibling(&self.0)),
+        }
+    }
+
+    /// Strips the last Luhmann segment to infer the parent ID.
+    ///
+    /// Within a section: `"1c2/3c5f1"` → `"1c2/3c5f"` → ... → `"1c2/3"` → `"1c2"`.
+    /// Across sections: `"1c2/1"` → `"1c2"` (first note in section, parent is section root).
+    /// No section: `"1a1"` → `"1a"` → `"1"` → `"1"` (root returns itself).
+    pub fn parent(&self) -> Self {
+        let s = &self.0;
+        if s.is_empty() { return self.clone(); }
+        match s.rfind('/') {
+            Some(slash) => {
+                let prefix = &s[..slash];
+                let local  = &s[slash + 1..];
+                let p = luhmann_parent_str(local);
+                if p == local { ID(prefix.to_string()) }
+                else          { ID(format!("{}/{}", prefix, p)) }
+            }
+            None => {
+                let p = luhmann_parent_str(s);
+                ID(p.to_string())
+            }
+        }
+    }
+
+    /// Returns `true` if `self` is a direct child of `parent`.
+    pub fn is_direct_child_of(&self, parent: &ID) -> bool {
+        self.parent() == *parent
+    }
+}
+
+impl From<&str> for ID {
+    fn from(s: &str) -> Self { ID(s.into()) }
+}
+
+impl From<String> for ID {
+    fn from(s: String) -> Self { ID(s) }
+}
+
+impl fmt::Display for ID {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(&self.0) }
+}
+
+impl fmt::Debug for ID {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "ID({})", self.0) }
+}
+
+impl PartialOrd for ID {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+}
+
+impl Ord for ID {
+    /// Compares IDs section by section (split by `/`), then segment by segment
+    /// within each section with proper numeric ordering.
+    ///
+    /// A prefix is always less than any of its extensions, so parents sort
+    /// before their children regardless of section boundaries.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        let mut a_parts = self.0.split('/');
+        let mut b_parts = other.0.split('/');
+        loop {
+            match (a_parts.next(), b_parts.next()) {
+                (None, None)       => return Ordering::Equal,
+                (None, _)          => return Ordering::Less,
+                (_, None)          => return Ordering::Greater,
+                (Some(a), Some(b)) => match cmp_luhmann(a, b) {
+                    Ordering::Equal => continue,
+                    other           => return other,
+                },
+            }
+        }
+    }
+}
+
+/// Returns the draw identifier for a note ID.
+///
+/// IDs are `<draw>/<note>` — the first `/`-section names the draw file.
+/// - `"1a/1c1h5"` → `"1a"`
+/// - `"1a/1"`     → `"1a"`
+fn draw_section(id: &ID) -> &str {
+    let s = id.0.as_str();
+    match s.find('/') {
+        Some(slash) => &s[..slash],
+        None        => "",
+    }
+}
+
+/// Converts a draw ID to a filename stem.
+/// Root draw (`""`) → `"root"`. Others are single Luhmann segments with no `/`.
+pub fn draw_filename(id: &ID) -> String {
+    if id.0.is_empty() { "root".into() } else { id.0.clone() }
+}
+
+fn draw_file_path(draws_dir: &Path, id: &ID) -> PathBuf {
+    draws_dir.join(format!("{}.json", draw_filename(id)))
+}
+
+/// Maximum notes per draw. Reflects the physical capacity of a wooden drawer.
+pub const DRAW_CAPACITY: usize = 5_000;
+
+/// A single physical drawer of the NoteBox.
+///
+/// Notes inside share the same draw prefix (e.g. `"1a"` for notes whose IDs
+/// start with `"1a/"`). `notes` is `None` until the draw is loaded from disk;
+/// after loading it is `Some(sorted Vec<Note>)`.
+#[derive(Debug, PartialEq)]
+pub struct Draw {
+    id: ID,
+    pub notes: Option<Vec<Note>>,
+}
+
+impl Draw {
+    fn stub(id: impl Into<ID>) -> Self { Draw { id: id.into(), notes: None } }
+    pub fn id(&self) -> &ID { &self.id }
+    /// Returns loaded notes as a slice, or an empty slice if not yet loaded.
+    pub fn notes(&self) -> &[Note] { self.notes.as_deref().unwrap_or(&[]) }
+    pub fn len(&self) -> usize { self.notes.as_ref().map_or(0, |n| n.len()) }
+    pub fn is_loaded(&self) -> bool { self.notes.is_some() }
+    pub fn is_full(&self) -> bool { self.len() >= DRAW_CAPACITY }
+}
+
+/// Outcome returned by [`NoteBox::remove`].
+pub enum RemoveOutcome {
+    /// Refused: these notes list the target as their parent.
+    /// Evolve the note with `update` rather than deleting it.
+    HasChildren(Vec<ID>),
+    /// One backlink was removed from this note. Review it, then call `remove` again.
+    BacklinkCleared(ID),
+    /// No backlinks remained — note was deleted.
+    Removed(Note),
+}
+
+/// Result returned by [`NoteBox::archive_update`].
+pub struct ArchiveUpdateResult {
+    /// ID of the new child note that holds the outdated content.
+    pub archive_id: ID,
+    /// IDs of notes that explicitly linked to the updated note before the update.
+    /// Review these to decide if they should point to the archive instead.
+    pub backlink_ids: Vec<ID>,
+}
+
+/// One auto-resolved action taken during [`merge_conflicts`].
+pub enum MergeAction {
+    /// Note existed only in the incoming branch; added without conflict.
+    Added(ID),
+    /// Same content on both sides; link lists were unioned.
+    LinksMerged(ID),
+    /// Content conflict: their version was renamed to preserve both.
+    Renamed { original: ID, renamed_to: ID },
+}
+
+/// Report for one draw file resolved by [`merge_conflicts`].
+pub struct MergeReport {
+    pub draw: ID,
+    pub actions: Vec<MergeAction>,
+}
+
+/// A NoteBox backed by a directory of per-draw JSON files.
+///
+/// `open(dir)` scans `draws/` and creates `Draw` stubs; notes are loaded
+/// lazily from `draws/<name>.json` on first access. `save()` writes every
+/// draw that has been loaded (and therefore may have changed).
+///
+/// Pass `dir: None` (via `Default`) for a fully in-memory instance — useful in
+/// tests and benchmarks. In that case `ensure_loaded` initialises each draw as
+/// an empty `Vec` and `save()` is a no-op.
+#[derive(Debug, Default, PartialEq)]
+pub struct NoteBox {
+    dir: Option<PathBuf>,
+    draws: Vec<Draw>,  // sorted by Draw.id for binary search
+}
+
+impl NoteBox {
+    /// Creates an in-memory NoteBox (no file backing). Useful for tests.
+    pub fn new() -> Self { Self::default() }
+
+    /// Creates a new NoteBox backed by `dir` (directory need not exist yet).
+    pub fn create(dir: impl Into<PathBuf>) -> Self {
+        NoteBox { dir: Some(dir.into()), draws: Vec::new() }
+    }
+
+    /// Opens an existing NoteBox from `dir`, discovering draws by scanning
+    /// `draws/*.json`. Draw notes are not loaded yet (lazy).
+    pub fn open(dir: &Path) -> io::Result<Self> {
+        let draws_dir = dir.join("draws");
+        let draw_ids: Vec<ID> = if draws_dir.exists() {
+            let mut ids = Vec::new();
+            for entry in fs::read_dir(&draws_dir)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let s = name.to_string_lossy();
+                if let Some(stem) = s.strip_suffix(".json") {
+                    let draw_id = if stem == "root" { ID(String::new()) } else { ID(stem.into()) };
+                    ids.push(draw_id);
+                }
+            }
+            ids.sort();
+            ids
+        } else {
+            Vec::new()
+        };
+        Ok(NoteBox {
+            dir: Some(dir.to_owned()),
+            draws: draw_ids.into_iter().map(Draw::stub).collect(),
+        })
+    }
+
+    /// Saves every loaded draw to `dir/draws/<name>.json`.
+    /// No-op when there is no backing directory.
+    pub fn save(&self) -> io::Result<()> {
+        let Some(ref dir) = self.dir else { return Ok(()); };
+        let draws_dir = dir.join("draws");
+        fs::create_dir_all(&draws_dir)?;
+        for draw in &self.draws {
+            if let Some(notes) = &draw.notes {
+                let json = json::to_string_pretty(notes)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                fs::write(draw_file_path(&draws_dir, &draw.id), json)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Loads all draws from disk. After this call all draws are in memory and
+    /// `&self` methods see the full note set.
+    pub fn load_all(&mut self) -> io::Result<()> {
+        for di in 0..self.draws.len() {
+            self.ensure_loaded(di)?;
+        }
+        Ok(())
+    }
+
+    pub fn draws(&self) -> &[Draw] { &self.draws }
+
+    /// Returns all currently-loaded notes in global ID order.
+    /// Call `load_all()` first if you need the complete set.
+    pub fn notes(&self) -> Vec<&Note> {
+        let mut all: Vec<&Note> = self.draws.iter()
+            .filter_map(|d| d.notes.as_ref())
+            .flat_map(|n| n.iter())
+            .collect();
+        all.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+        all
+    }
+
+    // ── internals ────────────────────────────────────────────────────────────
+
+    fn draw_idx(&self, section: &str) -> Result<usize, usize> {
+        self.draws.binary_search_by(|d| d.id.0.as_str().cmp(section))
+    }
+
+    /// Loads draw `di` from disk if not already loaded.
+    /// For in-memory instances (`dir == None`) initialises to an empty vec.
+    fn ensure_loaded(&mut self, di: usize) -> io::Result<()> {
+        if self.draws[di].notes.is_some() { return Ok(()); }
+        let dir = match self.dir.clone() {
+            None    => { self.draws[di].notes = Some(Vec::new()); return Ok(()); }
+            Some(d) => d,
+        };
+        let path = draw_file_path(&dir.join("draws"), &self.draws[di].id.clone());
+        let mut notes: Vec<Note> = if path.exists() {
+            let json = fs::read_to_string(&path)?;
+            json::from_str(&json)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+        } else {
+            Vec::new()
+        };
+        notes.sort_by(|a, b| a.id.cmp(&b.id));
+        self.draws[di].notes = Some(notes);
+        Ok(())
+    }
+
+    // ── public API ───────────────────────────────────────────────────────────
+
+    /// Finds a note by ID, loading its draw lazily. O(log k + log(n/k)).
+    pub fn find(&mut self, id: &ID) -> io::Result<Option<&Note>> {
+        let section = draw_section(id).to_string();
+        let di = match self.draw_idx(&section) { Ok(i) => i, Err(_) => return Ok(None) };
+        self.ensure_loaded(di)?;
+        let notes = self.draws[di].notes.as_ref().unwrap();
+        Ok(notes.binary_search_by(|n| n.id.cmp(id)).ok().map(|ni| &notes[ni]))
+    }
+
+    /// Finds a note by ID (mutable), loading its draw lazily.
+    pub fn find_mut(&mut self, id: &ID) -> io::Result<Option<&mut Note>> {
+        let section = draw_section(id).to_string();
+        let di = match self.draw_idx(&section) { Ok(i) => i, Err(_) => return Ok(None) };
+        self.ensure_loaded(di)?;
+        let ni = match self.draws[di].notes.as_ref().unwrap().binary_search_by(|n| n.id.cmp(id)) {
+            Ok(i) => i, Err(_) => return Ok(None),
+        };
+        Ok(Some(&mut self.draws[di].notes.as_mut().unwrap()[ni]))
+    }
+
+    /// Case-insensitive substring search. Loads all draws.
+    pub fn search(&mut self, query: &str) -> io::Result<Vec<&Note>> {
+        self.load_all()?;
+        let q = query.to_lowercase();
+        Ok(self.draws.iter()
+            .flat_map(|d| d.notes.as_ref().unwrap().iter())
+            .filter(|n| n.content.to_lowercase().contains(&q))
+            .collect())
+    }
+
+    /// Direct children of `parent`. Loads all draws.
+    pub fn children(&mut self, parent: &ID) -> io::Result<Vec<&Note>> {
+        self.load_all()?;
+        Ok(self.draws.iter()
+            .flat_map(|d| d.notes.as_ref().unwrap().iter())
+            .filter(|n| n.id.is_direct_child_of(parent))
+            .collect())
+    }
+
+    /// Breadcrumb path to `id` (exclusive). Loads ancestor draws lazily;
+    /// returns owned `Note`s to avoid holding multiple mutable borrows.
+    pub fn ancestors(&mut self, id: &ID) -> io::Result<Vec<Note>> {
+        let mut result: Vec<Note> = Vec::new();
+        let mut current = id.parent();
+        loop {
+            if current == *id { break; }
+            if let Some(note) = self.find(&current)? { result.push(note.clone()); }
+            let parent = current.parent();
+            if parent == current { break; }
+            current = parent;
+        }
+        result.reverse();
+        Ok(result)
+    }
+
+    /// Notes that link to `id`. Loads all draws.
+    pub fn backlinks(&mut self, id: &ID) -> io::Result<Vec<&Note>> {
+        self.load_all()?;
+        Ok(self.draws.iter()
+            .flat_map(|d| d.notes.as_ref().unwrap().iter())
+            .filter(|n| n.links.contains(id))
+            .collect())
+    }
+
+    /// Inserts a note into its draw (lazy-loaded). Returns `Err` if the draw is full.
+    pub fn add(&mut self, z: Note) -> Result<(), String> {
+        let section = draw_section(&z.id).to_string();
+        let di = match self.draw_idx(&section) {
+            Ok(i)  => i,
+            Err(i) => { self.draws.insert(i, Draw::stub(section.as_str())); i }
+        };
+        self.ensure_loaded(di).map_err(|e| e.to_string())?;
+        if self.draws[di].is_full() {
+            let name = if section.is_empty() { "root" } else { &section };
+            return Err(format!("draw '{name}' is full ({DRAW_CAPACITY})"));
+        }
+        let pos = self.draws[di].notes.as_ref().unwrap().partition_point(|n| n.id < z.id);
+        self.draws[di].notes.as_mut().unwrap().insert(pos, z);
+        Ok(())
+    }
+
+    /// Returns the first child ID of `id` that has no note yet.
+    ///
+    /// - Letter-ending IDs (e.g. `1c`): tries `1c1`, `1c2`, …
+    /// - Digit-ending IDs (e.g. `1a1`): tries `1a1a`, `1a1b`, …
+    ///
+    /// All draws must be loaded before calling this.
+    fn first_available_child(&mut self, id: &ID) -> io::Result<ID> {
+        let s = id.0.clone();
+        if s.as_bytes().last().map_or(false, |b| b.is_ascii_digit()) {
+            for c in b'a'..=b'z' {
+                let candidate = ID(format!("{}{}", s, c as char));
+                if self.find(&candidate)?.is_none() { return Ok(candidate); }
+            }
+            Err(io::Error::new(io::ErrorKind::Other,
+                format!("no available child slot for {}: all 26 letter slots taken", id)))
+        } else {
+            for n in 1u32.. {
+                let candidate = ID(format!("{}{}", s, n));
+                if self.find(&candidate)?.is_none() { return Ok(candidate); }
+            }
+            unreachable!()
+        }
+    }
+
+    /// Pushes the current content of `id` to a new child (marked `OUTDATED:`),
+    /// then replaces `id`'s content with `new_content`.
+    ///
+    /// The archive child receives:
+    /// - the old content prefixed with `"OUTDATED: "`
+    /// - all of the old note's links (old parent kept as a regular link)
+    /// - links to every existing direct child of `id`
+    ///
+    /// The original note keeps its existing links and gains a link to the child.
+    /// No notes are moved — only links are added.
+    ///
+    /// Returns `None` if `id` does not exist.
+    pub fn archive_update(&mut self, id: &ID, new_content: &str)
+        -> io::Result<Option<ArchiveUpdateResult>>
+    {
+        self.load_all()?;
+
+        let (old_content, old_links) = match self.find(id)? {
+            None    => return Ok(None),
+            Some(n) => (n.content().to_string(), n.links().to_vec()),
+        };
+
+        let child_ids: Vec<ID> = self.children(id)?
+            .iter().map(|n| n.id().clone()).collect();
+
+        let backlink_ids: Vec<ID> = self.backlinks(id)?
+            .iter().map(|n| n.id().clone()).collect();
+
+        let archive_id = self.first_available_child(id)?;
+
+        // Build archive note: parent=id, then old links, then existing children.
+        let mut archive = Note::new(
+            archive_id.clone(), id.clone(),
+            &format!("OUTDATED: {}", old_content),
+        );
+        for link in &old_links {
+            if !archive.links().contains(link) { archive.add_link(link.clone()); }
+        }
+        for cid in &child_ids {
+            if !archive.links().contains(cid) { archive.add_link(cid.clone()); }
+        }
+
+        // Insert archive first — if the draw is full we bail before touching the original.
+        self.add(archive).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        if let Some(note) = self.find_mut(id)? {
+            note.set_content(new_content);
+            note.add_link(archive_id.clone());
+        }
+
+        Ok(Some(ArchiveUpdateResult { archive_id, backlink_ids }))
+    }
+
+    /// Attempts to remove the note with the given `id`.
+    ///
+    /// - Returns `HasChildren` (and does nothing) if any note lists `id` as its
+    ///   parent or is a direct structural child. Use `update` to evolve the note.
+    /// - Returns `BacklinkCleared(from)` if a non-parent backlink was found: removes
+    ///   all links to `id` from that note and asks the caller to review it, then
+    ///   call `remove` again.
+    /// - Returns `Removed` once no backlinks remain and the note is deleted.
+    /// - Returns `None` if the note does not exist.
+    pub fn remove(&mut self, id: &ID) -> io::Result<Option<RemoveOutcome>> {
+        self.load_all()?;
+
+        if self.find(id)?.is_none() { return Ok(None); }
+
+        // Refuse if any note claims id as parent or is a structural child.
+        let children: Vec<ID> = self.draws.iter()
+            .flat_map(|d| d.notes.as_deref().unwrap_or(&[]).iter())
+            .filter(|n| n.id() != id
+                && (n.links().first() == Some(id) || n.id().is_direct_child_of(id)))
+            .map(|n| n.id().clone())
+            .collect();
+
+        if !children.is_empty() {
+            return Ok(Some(RemoveOutcome::HasChildren(children)));
+        }
+
+        // Clear one backlinker at a time.
+        let backlinker: Option<ID> = self.draws.iter()
+            .flat_map(|d| d.notes.as_deref().unwrap_or(&[]).iter())
+            .filter(|n| n.id() != id && n.links().get(1..).map_or(false, |s| s.contains(id)))
+            .map(|n| n.id().clone())
+            .next();
+
+        if let Some(from_id) = backlinker {
+            if let Some(note) = self.find_mut(&from_id)? {
+                // links[0] != id (ensured by children check above), so retain is safe.
+                note.links.retain(|l| l != id);
+            }
+            return Ok(Some(RemoveOutcome::BacklinkCleared(from_id)));
+        }
+
+        // No children, no backlinks — delete.
+        let section = draw_section(id).to_string();
+        let di = match self.draw_idx(&section) { Ok(i) => i, Err(_) => return Ok(None) };
+        let removed = self.draws[di].notes.as_ref().unwrap()
+            .binary_search_by(|n| n.id.cmp(id)).ok()
+            .map(|ni| self.draws[di].notes.as_mut().unwrap().remove(ni));
+
+        Ok(removed.map(RemoveOutcome::Removed))
+    }
+}
+
+// ── git conflict resolution ───────────────────────────────────────────────────
+
+fn has_conflict_markers(s: &str) -> bool {
+    s.contains("<<<<<<<")
+}
+
+/// Splits a file with git conflict markers into (head, theirs) versions.
+/// Lines outside conflict blocks appear in both sides unchanged.
+fn extract_sides(content: &str) -> (String, String) {
+    enum State { Normal, Head, Theirs }
+    let mut head = String::new();
+    let mut theirs = String::new();
+    let mut state = State::Normal;
+    for line in content.lines() {
+        match state {
+            State::Normal => {
+                if line.starts_with("<<<<<<<") { state = State::Head; }
+                else { head.push_str(line); head.push('\n');
+                       theirs.push_str(line); theirs.push('\n'); }
+            }
+            State::Head => {
+                if line.starts_with("=======") { state = State::Theirs; }
+                else { head.push_str(line); head.push('\n'); }
+            }
+            State::Theirs => {
+                if line.starts_with(">>>>>>>") { state = State::Normal; }
+                else { theirs.push_str(line); theirs.push('\n'); }
+            }
+        }
+    }
+    (head, theirs)
+}
+
+/// Returns the first sibling of `id` (same parent, next letter/number slot)
+/// that is not in `taken`.
+fn next_available_sibling(id: &ID, taken: &HashSet<ID>) -> ID {
+    let mut candidate = id.next_sibling();
+    while taken.contains(&candidate) { candidate = candidate.next_sibling(); }
+    candidate
+}
+
+fn merge_note_vecs(head: Vec<Note>, theirs: Vec<Note>) -> (Vec<Note>, Vec<MergeAction>) {
+    let mut merged = head;
+    let mut actions = Vec::new();
+    let mut taken: HashSet<ID> = merged.iter().map(|n| n.id().clone()).collect();
+
+    for their_note in theirs {
+        match merged.iter().position(|n| n.id() == their_note.id()) {
+            None => {
+                // Only in theirs — add it.
+                taken.insert(their_note.id().clone());
+                actions.push(MergeAction::Added(their_note.id().clone()));
+                merged.push(their_note);
+            }
+            Some(pos) => {
+                if merged[pos].content() == their_note.content() {
+                    // Same content; union the non-parent links.
+                    let id = their_note.id().clone();
+                    let mut changed = false;
+                    for link in their_note.links().iter().skip(1) {
+                        if !merged[pos].links().contains(link) {
+                            merged[pos].add_link(link.clone());
+                            changed = true;
+                        }
+                    }
+                    if changed { actions.push(MergeAction::LinksMerged(id)); }
+                    // else: identical — silently dedup
+                } else {
+                    // Content conflict — keep head, rename theirs to next sibling.
+                    let original = their_note.id().clone();
+                    let new_id = next_available_sibling(&original, &taken);
+                    taken.insert(new_id.clone());
+                    actions.push(MergeAction::Renamed { original, renamed_to: new_id.clone() });
+                    merged.push(their_note.with_id(new_id));
+                }
+            }
+        }
+    }
+
+    merged.sort_by(|a, b| a.id().cmp(b.id()));
+    (merged, actions)
+}
+
+/// Scans `dir/draws/` for git-conflicted JSON files and resolves them in place.
+///
+/// Resolution rules:
+/// - Note only in incoming branch → added.
+/// - Same ID, same content, different links → link lists unioned.
+/// - Same ID, different content → head version kept, their version renamed to
+///   the next available sibling ID so both are preserved.
+/// - One side removes a note the other kept → the kept version wins.
+pub fn merge_conflicts(dir: &Path) -> io::Result<Vec<MergeReport>> {
+    let draws_dir = dir.join("draws");
+    if !draws_dir.exists() { return Ok(Vec::new()); }
+
+    let mut reports = Vec::new();
+
+    for entry in fs::read_dir(&draws_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") { continue; }
+
+        let content = fs::read_to_string(&path)?;
+        if !has_conflict_markers(&content) { continue; }
+
+        let (head_str, theirs_str) = extract_sides(&content);
+
+        let head_notes: Vec<Note> = json::from_str(&head_str)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData,
+                format!("{}: head side: {}", path.display(), e)))?;
+        let theirs_notes: Vec<Note> = json::from_str(&theirs_str)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData,
+                format!("{}: their side: {}", path.display(), e)))?;
+
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let draw_id = if stem == "root" { ID(String::new()) } else { ID(stem.to_string()) };
+
+        let (resolved, actions) = merge_note_vecs(head_notes, theirs_notes);
+
+        let json = json::to_string_pretty(&resolved)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        fs::write(&path, json)?;
+
+        reports.push(MergeReport { draw: draw_id, actions });
+    }
+
+    Ok(reports)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- ID construction ---
+
+    #[test]
+    fn test_id_root() {
+        assert_eq!(ID::root("ZK1").to_string(), "ZK1");
+    }
+
+    #[test]
+    fn test_id_from_str() {
+        let id = ID::from("1a1");
+        assert_eq!(id.to_string(), "1a1");
+    }
+
+    #[test]
+    fn test_id_from_string() {
+        let id = ID::from("1a1".to_string());
+        assert_eq!(id.to_string(), "1a1");
+    }
+
+    // --- next_child ---
+
+    #[test]
+    fn test_next_child_from_letter_appends_one() {
+        // ends with letter → append '1'
+        assert_eq!(ID::from("1a").next_child(), ID::from("1a1"));
+    }
+
+    #[test]
+    fn test_next_child_increments_trailing_number() {
+        assert_eq!(ID::from("1a1").next_child(), ID::from("1a2"));
+    }
+
+    #[test]
+    fn test_next_child_carries_past_nine() {
+        assert_eq!(ID::from("1a9").next_child(), ID::from("1a10"));
+    }
+
+    // --- next_sibling ---
+
+    #[test]
+    fn test_next_sibling_from_number_appends_a() {
+        // ends with number → append 'a'
+        assert_eq!(ID::from("1").next_sibling(), ID::from("1a"));
+    }
+
+    #[test]
+    fn test_next_sibling_increments_trailing_letter() {
+        assert_eq!(ID::from("1a").next_sibling(), ID::from("1b"));
+    }
+
+    #[test]
+    fn test_next_sibling_deep() {
+        assert_eq!(ID::from("1a1").next_sibling(), ID::from("1a1a"));
+    }
+
+    // --- Ord ---
+
+    #[test]
+    fn test_id_ord_numeric_not_lexicographic() {
+        // lexicographically "9" > "10", but numerically 9 < 10
+        assert!(ID::from("9") < ID::from("10"));
+    }
+
+    #[test]
+    fn test_id_ord_parent_before_child() {
+        assert!(ID::from("1")  < ID::from("1a"));
+        assert!(ID::from("1a") < ID::from("1a1"));
+    }
+
+    #[test]
+    fn test_id_ord_siblings_in_order() {
+        assert!(ID::from("1a") < ID::from("1b"));
+        assert!(ID::from("1a1") < ID::from("1a2"));
+    }
+
+    #[test]
+    fn test_id_ord_subtree_before_next_sibling() {
+        // entire subtree of 1a (including deep children) comes before 1b
+        assert!(ID::from("1a99") < ID::from("1b"));
+    }
+
+    // --- NoteBox::add ---
+
+    #[test]
+    fn test_add_maintains_sorted_order() {
+        let mut zk = NoteBox::default();
+        // insert out of order
+        zk.add(Note::new("1b",  "1",  "banana")).unwrap();
+        zk.add(Note::new("1",   "1",  "root")).unwrap();
+        zk.add(Note::new("1a1", "1a", "cherry")).unwrap();
+        zk.add(Note::new("1a",  "1",  "apple")).unwrap();
+
+        let ids: Vec<String> = zk.notes().iter().map(|n| n.id.to_string()).collect();
+        assert_eq!(ids, ["1", "1a", "1a1", "1b"]);
+    }
+
+    #[test]
+    fn test_add_parent_before_children() {
+        let mut zk = NoteBox::default();
+        zk.add(Note::new("1a1", "1a", "child")).unwrap();
+        zk.add(Note::new("1a",  "1",  "parent")).unwrap();
+
+        let notes = zk.notes();
+        assert_eq!(notes[0].id, ID::from("1a"));
+        assert_eq!(notes[1].id, ID::from("1a1"));
+    }
+
+    #[test]
+    fn test_add_draw_capacity_enforced() {
+        let mut zk = NoteBox::default();
+        zk.add(Note::new("1", "1", "root")).unwrap();
+        assert!(!zk.draws[0].is_full());
+    }
+
+    #[test]
+    fn test_add_routes_to_correct_draw() {
+        let mut zk = NoteBox::default();
+        // first '/'-section is the draw name
+        zk.add(Note::new("1a/1",    "1a/1",  "index")).unwrap();
+        zk.add(Note::new("1a/1a",   "1a/1",  "child")).unwrap();
+        zk.add(Note::new("1b/1",    "1b/1",  "other draw")).unwrap();
+
+        assert_eq!(zk.draws.len(), 2);
+        assert_eq!(zk.draws[0].id, ID::from("1a"));
+        assert_eq!(zk.draws[0].len(), 2);             // "1a/1", "1a/1a"
+        assert_eq!(zk.draws[1].id, ID::from("1b"));
+        assert_eq!(zk.draws[1].len(), 1);             // "1b/1"
+    }
+
+    // --- Sections (/ separator) ---
+
+    #[test]
+    fn test_parent_section_first_note() {
+        // 1c2/1 is the first note in section rooted at 1c2; parent is 1c2
+        assert_eq!(ID::from("1c2/1").parent(), ID::from("1c2"));
+    }
+
+    #[test]
+    fn test_parent_within_section() {
+        // strip last Luhmann segment within the section part
+        assert_eq!(ID::from("1c2/3c5f1").parent(), ID::from("1c2/3c5f"));
+        assert_eq!(ID::from("1c2/3c5f").parent(),  ID::from("1c2/3c5"));
+        assert_eq!(ID::from("1c2/3c5").parent(),   ID::from("1c2/3c"));
+        assert_eq!(ID::from("1c2/3c").parent(),    ID::from("1c2/3"));
+        assert_eq!(ID::from("1c2/3").parent(),     ID::from("1c2"));
+    }
+
+    #[test]
+    fn test_parent_nested_section() {
+        assert_eq!(ID::from("1c2/4g1/3").parent(), ID::from("1c2/4g1"));
+        assert_eq!(ID::from("1c2/4g1/3a").parent(), ID::from("1c2/4g1/3"));
+    }
+
+    #[test]
+    fn test_is_direct_child_section_boundary() {
+        assert!( ID::from("1c2/1").is_direct_child_of(&ID::from("1c2")));
+        // 1c2/1a is a grandchild of 1c2 (child of 1c2/1), not direct child
+        assert!(!ID::from("1c2/1a").is_direct_child_of(&ID::from("1c2")));
+    }
+
+    #[test]
+    fn test_ord_section_after_parent() {
+        assert!(ID::from("1c2") < ID::from("1c2/1"));
+    }
+
+    #[test]
+    fn test_ord_section_before_next_sibling() {
+        // entire section subtree under 1c2 comes before 1c3
+        assert!(ID::from("1c2/1")  < ID::from("1c3"));
+        assert!(ID::from("1c2/1a") < ID::from("1c3"));
+    }
+
+    #[test]
+    fn test_ord_section_sorted_internally() {
+        assert!(ID::from("1c2/1")  < ID::from("1c2/1a"));
+        assert!(ID::from("1c2/1a") < ID::from("1c2/1b"));
+        assert!(ID::from("1c2/9")  < ID::from("1c2/10"));
+    }
+
+    #[test]
+    fn test_next_child_in_section() {
+        assert_eq!(ID::from("1c2/1a").next_child(),   ID::from("1c2/1a1"));
+        assert_eq!(ID::from("1c2/1a1").next_child(),  ID::from("1c2/1a2"));
+    }
+
+    #[test]
+    fn test_next_sibling_in_section() {
+        assert_eq!(ID::from("1c2/1").next_sibling(),  ID::from("1c2/1a"));
+        assert_eq!(ID::from("1c2/1a").next_sibling(), ID::from("1c2/1b"));
+    }
+
+    // --- archive_update ---
+
+    #[test]
+    fn test_archive_update_basic() {
+        let mut zk = NoteBox::default();
+        zk.add(Note::new("1a", "1", "original content")).unwrap();
+
+        let result = zk.archive_update(&ID::from("1a"), "new content").unwrap().unwrap();
+
+        // letter-ending → first child is "1a1"
+        assert_eq!(result.archive_id, ID::from("1a1"));
+
+        let original = zk.find(&ID::from("1a")).unwrap().unwrap();
+        assert_eq!(original.content(), "new content");
+        assert!(original.links().contains(&ID::from("1a1")));
+
+        let archive = zk.find(&ID::from("1a1")).unwrap().unwrap();
+        assert_eq!(archive.content(), "OUTDATED: original content");
+        assert_eq!(archive.parent(), Some(&ID::from("1a")));
+    }
+
+    #[test]
+    fn test_archive_update_digit_ending_id() {
+        let mut zk = NoteBox::default();
+        zk.add(Note::new("1a1", "1a", "old")).unwrap();
+
+        let result = zk.archive_update(&ID::from("1a1"), "new").unwrap().unwrap();
+
+        // digit-ending → first child is "1a1a"
+        assert_eq!(result.archive_id, ID::from("1a1a"));
+    }
+
+    #[test]
+    fn test_archive_update_skips_taken_children() {
+        let mut zk = NoteBox::default();
+        zk.add(Note::new("1a",  "1",  "parent")).unwrap();
+        zk.add(Note::new("1a1", "1a", "child")).unwrap();
+
+        let result = zk.archive_update(&ID::from("1a"), "new").unwrap().unwrap();
+
+        // "1a1" is taken, so archive goes to "1a2"
+        assert_eq!(result.archive_id, ID::from("1a2"));
+    }
+
+    #[test]
+    fn test_archive_update_old_links_and_children_in_archive() {
+        let mut zk = NoteBox::default();
+        let mut note = Note::new("1a", "1", "original");
+        note.add_link(ID::from("1b"));
+        zk.add(note).unwrap();
+        zk.add(Note::new("1a1", "1a", "existing child")).unwrap();
+
+        let result = zk.archive_update(&ID::from("1a"), "new").unwrap().unwrap();
+
+        let archive = zk.find(&result.archive_id).unwrap().unwrap();
+        // inherits old link to "1b"
+        assert!(archive.links().contains(&ID::from("1b")));
+        // links to existing child "1a1"
+        assert!(archive.links().contains(&ID::from("1a1")));
+    }
+
+    #[test]
+    fn test_archive_update_returns_none_if_not_found() {
+        let mut zk = NoteBox::default();
+        assert!(zk.archive_update(&ID::from("1a"), "x").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_archive_update_reports_backlinks() {
+        let mut zk = NoteBox::default();
+        zk.add(Note::new("1a", "1", "target")).unwrap();
+        let mut linker = Note::new("1b", "1", "linker");
+        linker.add_link(ID::from("1a"));
+        zk.add(linker).unwrap();
+
+        let result = zk.archive_update(&ID::from("1a"), "new").unwrap().unwrap();
+        assert!(result.backlink_ids.contains(&ID::from("1b")));
+    }
+
+    // --- File-based round-trip ---
+
+    #[test]
+    fn test_save_open_roundtrip() {
+        let dir = std::env::temp_dir().join("zk_test_roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut zk = NoteBox::create(&dir);
+        zk.add(Note::new("1a/1",   "1a/1",  "apple")).unwrap();
+        zk.add(Note::new("1a/1a",  "1a/1",  "banana")).unwrap();
+        zk.add(Note::new("1a/1a1", "1a/1a", "cherry")).unwrap();
+        zk.save().unwrap();
+
+        let mut loaded = NoteBox::open(&dir).unwrap();
+        loaded.load_all().unwrap();
+
+        assert_eq!(zk.notes(), loaded.notes());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+}
