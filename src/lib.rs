@@ -481,14 +481,20 @@ impl NoteBox {
     }
 
     /// Case-insensitive substring search, skipping superseded notes. Loads all draws.
+    /// Results are ranked: headline matches first, body-only matches second.
     pub fn search(&mut self, query: &str) -> io::Result<Vec<&Note>> {
         self.load_all()?;
         let q = query.to_lowercase();
         let superseded: HashSet<&ID> = self.superseded_ids();
-        Ok(self.draws.iter()
+        let mut results: Vec<&Note> = self.draws.iter()
             .flat_map(|d| d.notes.as_ref().unwrap().iter())
             .filter(|n| n.content.to_lowercase().contains(&q) && !superseded.contains(&n.id))
-            .collect())
+            .collect();
+        results.sort_by_key(|n| {
+            let headline = n.content().lines().next().unwrap_or("");
+            if headline.to_lowercase().contains(&q) { 0u8 } else { 1u8 }
+        });
+        Ok(results)
     }
 
     /// Direct children of `parent`. Loads all draws.
@@ -610,13 +616,19 @@ impl NoteBox {
     }
 
     /// Case-insensitive substring search, including superseded notes.
+    /// Results are ranked: headline matches first, body-only matches second.
     pub fn search_all(&mut self, query: &str) -> io::Result<Vec<&Note>> {
         self.load_all()?;
         let q = query.to_lowercase();
-        Ok(self.draws.iter()
+        let mut results: Vec<&Note> = self.draws.iter()
             .flat_map(|d| d.notes.as_ref().unwrap().iter())
             .filter(|n| n.content.to_lowercase().contains(&q))
-            .collect())
+            .collect();
+        results.sort_by_key(|n| {
+            let headline = n.content().lines().next().unwrap_or("");
+            if headline.to_lowercase().contains(&q) { 0u8 } else { 1u8 }
+        });
+        Ok(results)
     }
 
     /// Creates a new child note that supersedes `id`.
@@ -1042,6 +1054,20 @@ mod tests {
         let results = zk.search("cats").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id(), &ID::from("1a1"));
+    }
+
+    #[test]
+    fn test_search_headline_match_ranked_first() {
+        let mut zk = NoteBox::default();
+        // body-only match
+        zk.add(Note::new("1a", "1", "musings\ncats are interesting")).unwrap();
+        // headline match
+        zk.add(Note::new("1b", "1", "cats in history")).unwrap();
+
+        let results = zk.search("cats").unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id(), &ID::from("1b"), "headline match should come first");
+        assert_eq!(results[1].id(), &ID::from("1a"), "body-only match should come second");
     }
 
     #[test]
