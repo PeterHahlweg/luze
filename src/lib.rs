@@ -8,9 +8,9 @@
 //! - Changes become new branches from the relevant note
 //! - Links and indices can change when necessary (small fixes, rephrasing, git merges)
 //! - Main box only: raw thoughts and insights (~90,000 notes for Luhmann)
-//! - Updates push old content down the tree as archived children, keeping history                                                                                                                                                 
-//! - Notes can be removed, but should almost never be required
-//! - Notes are stored as JSON in per-drawer files, lazily loaded       
+//! - Content is immutable once written; new versions are child notes with `supersedes`
+//! - Links and indices can change when necessary
+//! - Notes are stored as JSON in per-drawer files, lazily loaded
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -99,6 +99,8 @@ pub struct Note {
     content: String,
     links: Vec<ID>,  // first entry is always the parent
     created_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    supersedes: Option<ID>,
 }
 
 impl Note {
@@ -111,6 +113,19 @@ impl Note {
             content: content.into(),
             links: vec![parent.into()],
             created_at: Utc::now(),
+            supersedes: None,
+        }
+    }
+
+    /// Creates a new version of an existing note.
+    /// The new note is a child of the superseded note.
+    pub fn new_version(id: impl Into<ID>, parent: impl Into<ID>, content: &str, supersedes: impl Into<ID>) -> Self {
+        Note {
+            id: id.into(),
+            content: content.into(),
+            links: vec![parent.into()],
+            created_at: Utc::now(),
+            supersedes: Some(supersedes.into()),
         }
     }
 
@@ -120,8 +135,7 @@ impl Note {
     /// Returns the parent ID (first link), if any.
     pub fn parent(&self) -> Option<&ID> { self.links.first() }
     pub fn links(&self) -> &[ID] { &self.links }
-
-    pub fn set_content(&mut self, content: &str) { self.content = content.into(); }
+    pub fn supersedes(&self) -> Option<&ID> { self.supersedes.as_ref() }
     pub fn add_link(&mut self, id: impl Into<ID>) { self.links.push(id.into()); }
     /// Returns a clone of this note with a different ID.
     pub fn with_id(mut self, id: impl Into<ID>) -> Self { self.id = id.into(); self }
@@ -313,26 +327,6 @@ impl Draw {
     pub fn is_full(&self) -> bool { self.len() >= DRAW_CAPACITY }
 }
 
-/// Outcome returned by [`NoteBox::remove`].
-pub enum RemoveOutcome {
-    /// Refused: these notes list the target as their parent.
-    /// Evolve the note with `update` rather than deleting it.
-    HasChildren(Vec<ID>),
-    /// One backlink was removed from this note. Review it, then call `remove` again.
-    BacklinkCleared(ID),
-    /// No backlinks remained — note was deleted.
-    Removed(Note),
-}
-
-/// Result returned by [`NoteBox::archive_update`].
-pub struct ArchiveUpdateResult {
-    /// ID of the new child note that holds the outdated content.
-    pub archive_id: ID,
-    /// IDs of notes that explicitly linked to the updated note before the update.
-    /// Review these to decide if they should point to the archive instead.
-    pub backlink_ids: Vec<ID>,
-}
-
 /// One auto-resolved action taken during [`merge_conflicts`].
 pub enum MergeAction {
     /// Note existed only in the incoming branch; added without conflict.
@@ -486,13 +480,14 @@ impl NoteBox {
         Ok(Some(&mut self.draws[di].notes.as_mut().unwrap()[ni]))
     }
 
-    /// Case-insensitive substring search. Loads all draws.
+    /// Case-insensitive substring search, skipping superseded notes. Loads all draws.
     pub fn search(&mut self, query: &str) -> io::Result<Vec<&Note>> {
         self.load_all()?;
         let q = query.to_lowercase();
+        let superseded: HashSet<&ID> = self.superseded_ids();
         Ok(self.draws.iter()
             .flat_map(|d| d.notes.as_ref().unwrap().iter())
-            .filter(|n| n.content.to_lowercase().contains(&q))
+            .filter(|n| n.content.to_lowercase().contains(&q) && !superseded.contains(&n.id))
             .collect())
     }
 
@@ -571,108 +566,80 @@ impl NoteBox {
         }
     }
 
-    /// Pushes the current content of `id` to a new child (marked `OUTDATED:`),
-    /// then replaces `id`'s content with `new_content`.
-    ///
-    /// The archive child receives:
-    /// - the old content prefixed with `"OUTDATED: "`
-    /// - all of the old note's links (old parent kept as a regular link)
-    /// - links to every existing direct child of `id`
-    ///
-    /// The original note keeps its existing links and gains a link to the child.
-    /// No notes are moved — only links are added.
-    ///
-    /// Returns `None` if `id` does not exist.
-    pub fn archive_update(&mut self, id: &ID, new_content: &str)
-        -> io::Result<Option<ArchiveUpdateResult>>
-    {
-        self.load_all()?;
-
-        let (old_content, old_links) = match self.find(id)? {
-            None    => return Ok(None),
-            Some(n) => (n.content().to_string(), n.links().to_vec()),
-        };
-
-        let child_ids: Vec<ID> = self.children(id)?
-            .iter().map(|n| n.id().clone()).collect();
-
-        let backlink_ids: Vec<ID> = self.backlinks(id)?
-            .iter().map(|n| n.id().clone()).collect();
-
-        let archive_id = self.first_available_child(id)?;
-
-        // Build archive note: parent=id, then old links, then existing children.
-        let mut archive = Note::new(
-            archive_id.clone(), id.clone(),
-            &format!("OUTDATED: {}", old_content),
-        );
-        for link in &old_links {
-            if !archive.links().contains(link) { archive.add_link(link.clone()); }
-        }
-        for cid in &child_ids {
-            if !archive.links().contains(cid) { archive.add_link(cid.clone()); }
-        }
-
-        // Insert archive first — if the draw is full we bail before touching the original.
-        self.add(archive).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-        if let Some(note) = self.find_mut(id)? {
-            note.set_content(new_content);
-            note.add_link(archive_id.clone());
-        }
-
-        Ok(Some(ArchiveUpdateResult { archive_id, backlink_ids }))
+    /// Returns the set of all IDs that have been superseded by another note.
+    /// All draws must be loaded first.
+    pub fn superseded_ids(&self) -> HashSet<&ID> {
+        self.draws.iter()
+            .flat_map(|d| d.notes.as_deref().unwrap_or(&[]).iter())
+            .filter_map(|n| n.supersedes.as_ref())
+            .collect()
     }
 
-    /// Attempts to remove the note with the given `id`.
-    ///
-    /// - Returns `HasChildren` (and does nothing) if any note lists `id` as its
-    ///   parent or is a direct structural child. Use `update` to evolve the note.
-    /// - Returns `BacklinkCleared(from)` if a non-parent backlink was found: removes
-    ///   all links to `id` from that note and asks the caller to review it, then
-    ///   call `remove` again.
-    /// - Returns `Removed` once no backlinks remain and the note is deleted.
-    /// - Returns `None` if the note does not exist.
-    pub fn remove(&mut self, id: &ID) -> io::Result<Option<RemoveOutcome>> {
+    /// Returns true if any loaded note has `supersedes == Some(id)`.
+    /// All draws must be loaded first (call `load_all()`).
+    pub fn is_superseded(&self, id: &ID) -> bool {
+        self.draws.iter()
+            .flat_map(|d| d.notes.as_deref().unwrap_or(&[]).iter())
+            .any(|n| n.supersedes.as_ref() == Some(id))
+    }
+
+    /// Returns the ID of the note that supersedes `id`, if any.
+    /// All draws must be loaded first.
+    pub fn superseded_by(&self, id: &ID) -> Option<&ID> {
+        self.draws.iter()
+            .flat_map(|d| d.notes.as_deref().unwrap_or(&[]).iter())
+            .find(|n| n.supersedes.as_ref() == Some(id))
+            .map(|n| &n.id)
+    }
+
+    /// Follows the supersedes chain from `id` to the leaf (current version).
+    /// Returns `None` if `id` is not found. Returns the note at `id` itself if not superseded.
+    /// All draws must be loaded first.
+    pub fn current_version(&self, id: &ID) -> Option<&Note> {
+        let all: Vec<&Note> = self.draws.iter()
+            .flat_map(|d| d.notes.as_deref().unwrap_or(&[]).iter())
+            .collect();
+        let mut current = all.iter().find(|n| n.id == *id).copied()?;
+        loop {
+            match all.iter().find(|n| n.supersedes.as_ref() == Some(&current.id)) {
+                Some(next) => current = next,
+                None => break,
+            }
+        }
+        Some(current)
+    }
+
+    /// Case-insensitive substring search, including superseded notes.
+    pub fn search_all(&mut self, query: &str) -> io::Result<Vec<&Note>> {
+        self.load_all()?;
+        let q = query.to_lowercase();
+        Ok(self.draws.iter()
+            .flat_map(|d| d.notes.as_ref().unwrap().iter())
+            .filter(|n| n.content.to_lowercase().contains(&q))
+            .collect())
+    }
+
+    /// Creates a new child note that supersedes `id`.
+    /// Returns the new note's ID, or an error if:
+    /// - `id` doesn't exist
+    /// - `id` is already superseded (linear chain enforced)
+    pub fn update(&mut self, id: &ID, new_content: &str) -> io::Result<ID> {
         self.load_all()?;
 
-        if self.find(id)?.is_none() { return Ok(None); }
-
-        // Refuse if any note claims id as parent or is a structural child.
-        let children: Vec<ID> = self.draws.iter()
-            .flat_map(|d| d.notes.as_deref().unwrap_or(&[]).iter())
-            .filter(|n| n.id() != id
-                && (n.links().first() == Some(id) || n.id().is_direct_child_of(id)))
-            .map(|n| n.id().clone())
-            .collect();
-
-        if !children.is_empty() {
-            return Ok(Some(RemoveOutcome::HasChildren(children)));
+        if self.find(id)?.is_none() {
+            return Err(io::Error::new(io::ErrorKind::NotFound,
+                format!("note {} not found", id)));
         }
 
-        // Clear one backlinker at a time.
-        let backlinker: Option<ID> = self.draws.iter()
-            .flat_map(|d| d.notes.as_deref().unwrap_or(&[]).iter())
-            .filter(|n| n.id() != id && n.links().get(1..).map_or(false, |s| s.contains(id)))
-            .map(|n| n.id().clone())
-            .next();
-
-        if let Some(from_id) = backlinker {
-            if let Some(note) = self.find_mut(&from_id)? {
-                // links[0] != id (ensured by children check above), so retain is safe.
-                note.links.retain(|l| l != id);
-            }
-            return Ok(Some(RemoveOutcome::BacklinkCleared(from_id)));
+        if self.is_superseded(id) {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists,
+                format!("{} is already superseded", id)));
         }
 
-        // No children, no backlinks — delete.
-        let section = draw_section(id).to_string();
-        let di = match self.draw_idx(&section) { Ok(i) => i, Err(_) => return Ok(None) };
-        let removed = self.draws[di].notes.as_ref().unwrap()
-            .binary_search_by(|n| n.id.cmp(id)).ok()
-            .map(|ni| self.draws[di].notes.as_mut().unwrap().remove(ni));
-
-        Ok(removed.map(RemoveOutcome::Removed))
+        let child_id = self.first_available_child(id)?;
+        let note = Note::new_version(child_id.clone(), id.clone(), new_content, id.clone());
+        self.add(note).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        Ok(child_id)
     }
 }
 
@@ -1000,83 +967,91 @@ mod tests {
         assert_eq!(ID::from("1c2/1a").next_sibling(), ID::from("1c2/1b"));
     }
 
-    // --- archive_update ---
+    // --- supersedes ---
 
     #[test]
-    fn test_archive_update_basic() {
-        let mut zk = NoteBox::default();
-        zk.add(Note::new("1a", "1", "original content")).unwrap();
+    fn test_supersedes_field_roundtrip() {
+        let dir = std::env::temp_dir().join("zk_test_supersedes_rt");
+        let _ = std::fs::remove_dir_all(&dir);
 
-        let result = zk.archive_update(&ID::from("1a"), "new content").unwrap().unwrap();
+        let mut zk = NoteBox::create(&dir);
+        zk.add(Note::new("1a", "1", "original")).unwrap();
+        zk.add(Note::new_version("1a1", "1a", "better", "1a")).unwrap();
+        zk.save().unwrap();
 
-        // letter-ending → first child is "1a1"
-        assert_eq!(result.archive_id, ID::from("1a1"));
+        let mut loaded = NoteBox::open(&dir).unwrap();
+        loaded.load_all().unwrap();
+        let note = loaded.find(&ID::from("1a1")).unwrap().unwrap();
+        assert_eq!(note.supersedes(), Some(&ID::from("1a")));
 
-        let original = zk.find(&ID::from("1a")).unwrap().unwrap();
-        assert_eq!(original.content(), "new content");
-        assert!(original.links().contains(&ID::from("1a1")));
+        let plain = loaded.find(&ID::from("1a")).unwrap().unwrap();
+        assert_eq!(plain.supersedes(), None);
 
-        let archive = zk.find(&ID::from("1a1")).unwrap().unwrap();
-        assert_eq!(archive.content(), "OUTDATED: original content");
-        assert_eq!(archive.parent(), Some(&ID::from("1a")));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn test_archive_update_digit_ending_id() {
+    fn test_update_creates_superseding_child() {
         let mut zk = NoteBox::default();
-        zk.add(Note::new("1a1", "1a", "old")).unwrap();
+        zk.add(Note::new("1a", "1", "original")).unwrap();
 
-        let result = zk.archive_update(&ID::from("1a1"), "new").unwrap().unwrap();
+        let child_id = zk.update(&ID::from("1a"), "better").unwrap();
+        assert_eq!(child_id, ID::from("1a1"));
 
-        // digit-ending → first child is "1a1a"
-        assert_eq!(result.archive_id, ID::from("1a1a"));
+        let child = zk.find(&child_id).unwrap().unwrap();
+        assert_eq!(child.content(), "better");
+        assert_eq!(child.supersedes(), Some(&ID::from("1a")));
+        assert_eq!(child.parent(), Some(&ID::from("1a")));
     }
 
     #[test]
-    fn test_archive_update_skips_taken_children() {
+    fn test_update_rejects_already_superseded() {
         let mut zk = NoteBox::default();
-        zk.add(Note::new("1a",  "1",  "parent")).unwrap();
-        zk.add(Note::new("1a1", "1a", "child")).unwrap();
-
-        let result = zk.archive_update(&ID::from("1a"), "new").unwrap().unwrap();
-
-        // "1a1" is taken, so archive goes to "1a2"
-        assert_eq!(result.archive_id, ID::from("1a2"));
+        zk.add(Note::new("1a", "1", "v1")).unwrap();
+        zk.update(&ID::from("1a"), "v2").unwrap();
+        assert!(zk.update(&ID::from("1a"), "v3").is_err());
     }
 
     #[test]
-    fn test_archive_update_old_links_and_children_in_archive() {
+    fn test_is_superseded() {
         let mut zk = NoteBox::default();
-        let mut note = Note::new("1a", "1", "original");
-        note.add_link(ID::from("1b"));
-        zk.add(note).unwrap();
-        zk.add(Note::new("1a1", "1a", "existing child")).unwrap();
-
-        let result = zk.archive_update(&ID::from("1a"), "new").unwrap().unwrap();
-
-        let archive = zk.find(&result.archive_id).unwrap().unwrap();
-        // inherits old link to "1b"
-        assert!(archive.links().contains(&ID::from("1b")));
-        // links to existing child "1a1"
-        assert!(archive.links().contains(&ID::from("1a1")));
+        zk.add(Note::new("1a", "1", "v1")).unwrap();
+        assert!(!zk.is_superseded(&ID::from("1a")));
+        zk.update(&ID::from("1a"), "v2").unwrap();
+        assert!(zk.is_superseded(&ID::from("1a")));
     }
 
     #[test]
-    fn test_archive_update_returns_none_if_not_found() {
+    fn test_current_version() {
         let mut zk = NoteBox::default();
-        assert!(zk.archive_update(&ID::from("1a"), "x").unwrap().is_none());
+        zk.add(Note::new("1a", "1", "v1")).unwrap();
+        zk.update(&ID::from("1a"), "v2").unwrap();
+        // 1a1 supersedes 1a; now update 1a1
+        zk.update(&ID::from("1a1"), "v3").unwrap();
+
+        let current = zk.current_version(&ID::from("1a")).unwrap();
+        assert_eq!(current.content(), "v3");
     }
 
     #[test]
-    fn test_archive_update_reports_backlinks() {
+    fn test_search_skips_superseded() {
         let mut zk = NoteBox::default();
-        zk.add(Note::new("1a", "1", "target")).unwrap();
-        let mut linker = Note::new("1b", "1", "linker");
-        linker.add_link(ID::from("1a"));
-        zk.add(linker).unwrap();
+        zk.add(Note::new("1a", "1", "thought about cats")).unwrap();
+        zk.update(&ID::from("1a"), "better thought about cats").unwrap();
 
-        let result = zk.archive_update(&ID::from("1a"), "new").unwrap().unwrap();
-        assert!(result.backlink_ids.contains(&ID::from("1b")));
+        let results = zk.search("cats").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id(), &ID::from("1a1"));
+    }
+
+    #[test]
+    fn test_search_all_includes_superseded() {
+        let mut zk = NoteBox::default();
+        zk.add(Note::new("1a", "1", "thought about cats")).unwrap();
+        zk.update(&ID::from("1a"), "better thought about cats").unwrap();
+
+        let results = zk.search_all("cats").unwrap();
+        assert_eq!(results.len(), 2);
     }
 
     // --- File-based round-trip ---

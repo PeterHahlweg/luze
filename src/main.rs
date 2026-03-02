@@ -1,5 +1,5 @@
-use std::{env, path::PathBuf, process};
-use luze::{ID, Note, NoteBox, RemoveOutcome, MergeAction, merge_conflicts};
+use std::{collections::HashSet, env, path::PathBuf, process};
+use luze::{ID, Note, NoteBox, MergeAction, merge_conflicts};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -51,84 +51,10 @@ fn main() {
             let id = ID::from(args[2].as_str());
             let content = args[3..].join(" ");
             let mut zk = load_zk();
-            match zk.archive_update(&id, &content) {
-                Ok(Some(result)) => {
+            match zk.update(&id, &content) {
+                Ok(new_id) => {
                     save_zk(&zk);
-                    println!("archived → {}", result.archive_id);
-                    if !result.backlink_ids.is_empty() {
-                        println!("backlinks to review:");
-                        for bid in &result.backlink_ids {
-                            println!("  {}", bid);
-                        }
-                    }
-                }
-                Ok(None) => {
-                    eprintln!("error: note {} not found", id);
-                    process::exit(1);
-                }
-                Err(e) => {
-                    eprintln!("error: {}", e);
-                    process::exit(1);
-                }
-            }
-        }
-
-        "fix" => {
-            if args.len() < 4 {
-                eprintln!("error: usage: zk fix <id> <content>");
-                process::exit(1);
-            }
-            let id = ID::from(args[2].as_str());
-            let content = args[3..].join(" ");
-            let mut zk = load_zk();
-            match zk.find_mut(&id) {
-                Ok(Some(note)) => { note.set_content(&content); save_zk(&zk); }
-                Ok(None) => {
-                    eprintln!("error: note {} not found", id);
-                    process::exit(1);
-                }
-                Err(e) => {
-                    eprintln!("error: {}", e);
-                    process::exit(1);
-                }
-            }
-        }
-
-        "remove" => {
-            if args.len() < 3 {
-                eprintln!("error: usage: zk remove <id>");
-                process::exit(1);
-            }
-            let id = ID::from(args[2].as_str());
-            let mut zk = load_zk();
-            match zk.remove(&id) {
-                Ok(Some(RemoveOutcome::HasChildren(children))) => {
-                    let list: Vec<String> = children.iter().map(|i| i.to_string()).collect();
-                    eprintln!("error: {} has children: {}", id, list.join(", "));
-                    eprintln!("hint:  use 'zk update {}' to evolve this note instead", id);
-                    process::exit(1);
-                }
-                Ok(Some(RemoveOutcome::BacklinkCleared(from))) => {
-                    save_zk(&zk);
-                    println!("review: {} no longer links to {} — does its content still make sense?\n", from, id);
-                    if let Ok(Some(note)) = zk.find(&from) {
-                        println!("ID:      {}", note.id());
-                        println!("Content: {}", note.content());
-                        let links = note.links();
-                        if !links.is_empty() {
-                            let joined: Vec<String> = links.iter().map(|l| l.to_string()).collect();
-                            println!("Links:   {}", joined.join(", "));
-                        }
-                    }
-                    println!("\ncontinue: zk remove {}", id);
-                }
-                Ok(Some(RemoveOutcome::Removed(_))) => {
-                    save_zk(&zk);
-                    println!("removed {}", id);
-                }
-                Ok(None) => {
-                    eprintln!("error: note {} not found", id);
-                    process::exit(1);
+                    println!("{} supersedes {}", new_id, id);
                 }
                 Err(e) => {
                     eprintln!("error: {}", e);
@@ -187,9 +113,12 @@ fn main() {
         }
 
         "list" => {
+            let show_all = args.iter().any(|a| a == "--all");
             let mut zk = load_zk();
             zk.load_all().unwrap_or_else(|e| { eprintln!("error: {}", e); process::exit(1) });
+            let superseded: HashSet<&ID> = if show_all { HashSet::new() } else { zk.superseded_ids() };
             for note in zk.notes() {
+                if !show_all && superseded.contains(note.id()) { continue; }
                 let preview: String = note.content().chars().take(60).collect();
                 println!("{:<6} {}", note.id(), preview);
             }
@@ -202,11 +131,19 @@ fn main() {
             }
             let id = ID::from(args[2].as_str());
             let mut zk = load_zk();
+            zk.load_all().unwrap_or_else(|e| { eprintln!("error: {}", e); process::exit(1) });
             match zk.find(&id) {
                 Ok(Some(note)) => {
+                    let note = note.clone();
                     println!("ID:      {}", note.id());
                     println!("Created: {}", note.created_at().format("%Y-%m-%d %H:%M:%S UTC"));
                     println!("Content: {}", note.content());
+                    if let Some(sup) = note.supersedes() {
+                        println!("Supersedes: {}", sup);
+                    }
+                    if let Some(by) = zk.superseded_by(note.id()) {
+                        println!("Superseded by: {}", by);
+                    }
                     let links = note.links();
                     if !links.is_empty() {
                         let joined: Vec<String> = links.iter().map(|l| l.to_string()).collect();
@@ -274,10 +211,16 @@ fn main() {
                 eprintln!("error: usage: zk search <query>");
                 process::exit(1);
             }
-            let query = args[2..].join(" ");
+            let show_all = args.iter().any(|a| a == "--all");
+            let query: String = args[2..].iter()
+                .filter(|a| a.as_str() != "--all")
+                .cloned().collect::<Vec<_>>().join(" ");
             let mut zk = load_zk();
-            let notes = zk.search(&query)
-                .unwrap_or_else(|e| { eprintln!("error: {}", e); process::exit(1) });
+            let notes = if show_all {
+                zk.search_all(&query)
+            } else {
+                zk.search(&query)
+            }.unwrap_or_else(|e| { eprintln!("error: {}", e); process::exit(1) });
             for note in notes {
                 let preview: String = note.content().chars().take(60).collect();
                 println!("{:<6} {}", note.id(), preview);
@@ -287,6 +230,7 @@ fn main() {
         "tree" => {
             let mut max_depth = usize::MAX;
             let mut root_id: Option<ID> = None;
+            let mut show_all_versions = false;
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
@@ -301,6 +245,7 @@ fn main() {
                             process::exit(1)
                         });
                     }
+                    "--all-versions" => show_all_versions = true,
                     id_str => root_id = Some(ID::from(id_str)),
                 }
                 i += 1;
@@ -309,13 +254,18 @@ fn main() {
             let mut zk = load_zk();
             zk.load_all().unwrap_or_else(|e| { eprintln!("error: {}", e); process::exit(1) });
             let all_notes = zk.notes();
+            let superseded: HashSet<&ID> = if show_all_versions {
+                HashSet::new()
+            } else {
+                zk.superseded_ids()
+            };
 
             if let Some(ref id) = root_id {
                 if all_notes.iter().all(|n| n.id() != id) {
                     eprintln!("error: note {} not found", id);
                     process::exit(1);
                 }
-                print_tree(&all_notes, id, 0, max_depth, "", true);
+                print_tree(&all_notes, &superseded, id, 0, max_depth, "", true);
             } else {
                 let roots: Vec<&Note> = all_notes.iter()
                     .filter(|n| n.parent().map_or(false, |p| p == n.id()))
@@ -323,7 +273,7 @@ fn main() {
                     .collect();
                 let last = roots.len().saturating_sub(1);
                 for (i, root) in roots.iter().enumerate() {
-                    print_tree(&all_notes, root.id(), 0, max_depth, "", i == last);
+                    print_tree(&all_notes, &superseded, root.id(), 0, max_depth, "", i == last);
                 }
             }
         }
@@ -381,13 +331,40 @@ fn main() {
     }
 }
 
-fn print_tree(all: &[&Note], id: &ID, depth: usize, max_depth: usize, prefix: &str, is_last: bool) {
+fn print_tree(all: &[&Note], superseded: &HashSet<&ID>, id: &ID, depth: usize, max_depth: usize, prefix: &str, is_last: bool) {
     let note = all.iter().find(|n| n.id() == id);
+
+    // If this note is superseded and we're collapsing versions, find the chain leaf
+    if !superseded.is_empty() && superseded.contains(id) {
+        return; // skip — the superseding child will appear in its own position
+    }
+
+    let version_marker = if let Some(n) = note {
+        if n.supersedes().is_some() {
+            // Count how many generations back
+            let mut count = 1;
+            let mut cur = n.supersedes();
+            while let Some(prev_id) = cur {
+                if let Some(prev) = all.iter().find(|n| n.id() == prev_id) {
+                    if prev.supersedes().is_some() { count += 1; }
+                    cur = prev.supersedes();
+                } else {
+                    break;
+                }
+            }
+            if count > 0 { format!(" [v{}]", count + 1) } else { String::new() }
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
     let preview: String = note
         .map_or("", |n| n.content())
         .chars().take(50).collect();
     let connector = if depth == 0 { "" } else if is_last { "└── " } else { "├── " };
-    println!("{}{}{} {}", prefix, connector, id, preview);
+    println!("{}{}{}{} {}", prefix, connector, id, version_marker, preview);
 
     if depth >= max_depth { return; }
 
@@ -400,12 +377,13 @@ fn print_tree(all: &[&Note], id: &ID, depth: usize, max_depth: usize, prefix: &s
     };
 
     let children: Vec<&Note> = all.iter()
-        .filter(|n| n.id() != id && n.id().is_direct_child_of(id))
+        .filter(|n| n.id() != id && n.id().is_direct_child_of(id)
+            && (superseded.is_empty() || !superseded.contains(n.id())))
         .copied()
         .collect();
     let last = children.len().saturating_sub(1);
     for (i, child) in children.iter().enumerate() {
-        print_tree(all, child.id(), depth + 1, max_depth, &child_prefix, i == last);
+        print_tree(all, superseded, child.id(), depth + 1, max_depth, &child_prefix, i == last);
     }
 }
 
@@ -434,19 +412,17 @@ fn print_help() {
     println!("Commands:");
     println!("  init                    Create zk/draws/ directory");
     println!("  add <id> <content>      Add a note; parent derived from ID");
-    println!("  update <id> <content>   Archive old content as a child (OUTDATED), set new content");
-    println!("  fix    <id> <content>   In-place content fix (typos, rephrasing — no archive)");
-    println!("  remove <id>             Remove a note (does not update backlinks)");
+    println!("  update <id> <content>   Create a new child note that supersedes <id>");
     println!("  link <from> <to>        Add a link from one note to another");
     println!("  unlink <from> <to>      Remove a link between two notes");
-    println!("  list                    Print all notes (id + first 60 chars)");
-    println!("  show <id>               Print full content + links");
+    println!("  list [--all]            Print all notes (skip superseded unless --all)");
+    println!("  show <id>               Print full content + links + version info");
     println!("  children <id>           List direct children of a note");
     println!("  ancestors <id>          Print breadcrumb path to a note");
     println!("  backlinks <id>          Notes that link to this note");
-    println!("  search <query>          Case-insensitive content search");
+    println!("  search [--all] <query>  Case-insensitive search (skip superseded unless --all)");
     println!("  merge                   Auto-resolve git conflicts in draw files");
-    println!("  tree [-d <depth>] [id]  Show subtree (default: all roots, unlimited depth)");
+    println!("  tree [--all-versions] [-d <depth>] [id]  Show subtree");
     println!("  help                    Show this message");
     println!();
     println!("Environment:");
