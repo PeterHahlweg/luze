@@ -393,6 +393,23 @@ fn validate_content(content: &str) {
 }
 
 fn print_help() {
+    println!("luze — a digital Zettelkasten in the spirit of Luhmann.");
+    println!();
+    println!("Niklas Luhmann kept a box of handwritten notes (Zettel) that became his");
+    println!("primary tool for thinking and writing. There are no categories or tags.");
+    println!("Instead, each note gets a fixed position in a branching tree — you attach");
+    println!("a new thought to the most relevant existing note, and topics emerge from");
+    println!("the branches that grow. Cross-links connect related notes across distant");
+    println!("parts of the tree. Over time, you may write a note that ties a cluster");
+    println!("together — not as a predefined category, but as a summary of structure");
+    println!("that has already grown.");
+    println!();
+    println!("Notes have a hierarchical ID (e.g. 1a2b), immutable content, and links.");
+    println!("New thoughts branch from existing notes; updates create a new child that");
+    println!("supersedes the original. The first line of a note is its headline (max");
+    println!("150 chars for single-line notes). Use search to find entry points, then");
+    println!("navigate with show, children, backlinks, and ancestors.");
+    println!();
     println!("Usage: zk <command> [args]");
     println!();
     println!("Commands:");
