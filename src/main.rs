@@ -21,6 +21,7 @@ fn main() {
             }
             let id = ID::from(args[2].as_str());
             let content = args[3..].join(" ");
+            validate_content(&content);
             let mut zk = load_zk();
             let parent = id.parent();
             if parent != id {
@@ -50,6 +51,7 @@ fn main() {
             }
             let id = ID::from(args[2].as_str());
             let content = args[3..].join(" ");
+            validate_content(&content);
             let mut zk = load_zk();
             match zk.update(&id, &content) {
                 Ok(new_id) => {
@@ -119,8 +121,7 @@ fn main() {
             let superseded: HashSet<&ID> = if show_all { HashSet::new() } else { zk.superseded_ids() };
             for note in zk.notes() {
                 if !show_all && superseded.contains(note.id()) { continue; }
-                let preview: String = note.content().chars().take(60).collect();
-                println!("{:<6} {}", note.id(), preview);
+                println!("{:<6} {}", note.id(), headline(note.content()));
             }
         }
 
@@ -171,8 +172,7 @@ fn main() {
             let notes = zk.children(&id)
                 .unwrap_or_else(|e| { eprintln!("error: {}", e); process::exit(1) });
             for note in notes {
-                let preview: String = note.content().chars().take(60).collect();
-                println!("{:<6} {}", note.id(), preview);
+                println!("{:<6} {}", note.id(), headline(note.content()));
             }
         }
 
@@ -186,8 +186,7 @@ fn main() {
             let notes = zk.ancestors(&id)
                 .unwrap_or_else(|e| { eprintln!("error: {}", e); process::exit(1) });
             for note in &notes {
-                let preview: String = note.content().chars().take(60).collect();
-                println!("{:<6} {}", note.id(), preview);
+                println!("{:<6} {}", note.id(), headline(note.content()));
             }
         }
 
@@ -201,8 +200,7 @@ fn main() {
             let notes = zk.backlinks(&id)
                 .unwrap_or_else(|e| { eprintln!("error: {}", e); process::exit(1) });
             for note in notes {
-                let preview: String = note.content().chars().take(60).collect();
-                println!("{:<6} {}", note.id(), preview);
+                println!("{:<6} {}", note.id(), headline(note.content()));
             }
         }
 
@@ -222,15 +220,13 @@ fn main() {
                 zk.search(&query)
             }.unwrap_or_else(|e| { eprintln!("error: {}", e); process::exit(1) });
             for note in notes {
-                let preview: String = note.content().chars().take(60).collect();
-                println!("{:<6} {}", note.id(), preview);
+                println!("{:<6} {}", note.id(), headline(note.content()));
             }
         }
 
         "tree" => {
             let mut max_depth = usize::MAX;
             let mut root_id: Option<ID> = None;
-            let mut show_all_versions = false;
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
@@ -245,7 +241,6 @@ fn main() {
                             process::exit(1)
                         });
                     }
-                    "--all-versions" => show_all_versions = true,
                     id_str => root_id = Some(ID::from(id_str)),
                 }
                 i += 1;
@@ -254,11 +249,7 @@ fn main() {
             let mut zk = load_zk();
             zk.load_all().unwrap_or_else(|e| { eprintln!("error: {}", e); process::exit(1) });
             let all_notes = zk.notes();
-            let superseded: HashSet<&ID> = if show_all_versions {
-                HashSet::new()
-            } else {
-                zk.superseded_ids()
-            };
+            let superseded = zk.superseded_ids();
 
             if let Some(ref id) = root_id {
                 if all_notes.iter().all(|n| n.id() != id) {
@@ -334,37 +325,18 @@ fn main() {
 fn print_tree(all: &[&Note], superseded: &HashSet<&ID>, id: &ID, depth: usize, max_depth: usize, prefix: &str, is_last: bool) {
     let note = all.iter().find(|n| n.id() == id);
 
-    // If this note is superseded and we're collapsing versions, find the chain leaf
-    if !superseded.is_empty() && superseded.contains(id) {
-        return; // skip — the superseding child will appear in its own position
-    }
-
-    let version_marker = if let Some(n) = note {
-        if n.supersedes().is_some() {
-            // Count how many generations back
-            let mut count = 1;
-            let mut cur = n.supersedes();
-            while let Some(prev_id) = cur {
-                if let Some(prev) = all.iter().find(|n| n.id() == prev_id) {
-                    if prev.supersedes().is_some() { count += 1; }
-                    cur = prev.supersedes();
-                } else {
-                    break;
-                }
-            }
-            if count > 0 { format!(" [v{}]", count + 1) } else { String::new() }
-        } else {
-            String::new()
-        }
+    // Version marker: [v2] if this note supersedes another, [outdated] if it is itself superseded
+    let marker = if superseded.contains(id) {
+        " [outdated]"
+    } else if note.map_or(false, |n| n.supersedes().is_some()) {
+        " [v2]"  // could count generations, but v2 is clear enough for the tree
     } else {
-        String::new()
+        ""
     };
 
-    let preview: String = note
-        .map_or("", |n| n.content())
-        .chars().take(50).collect();
+    let preview = headline(note.map_or("", |n| n.content()));
     let connector = if depth == 0 { "" } else if is_last { "└── " } else { "├── " };
-    println!("{}{}{}{} {}", prefix, connector, id, version_marker, preview);
+    println!("{}{}{}{} {}", prefix, connector, id, marker, preview);
 
     if depth >= max_depth { return; }
 
@@ -377,8 +349,7 @@ fn print_tree(all: &[&Note], superseded: &HashSet<&ID>, id: &ID, depth: usize, m
     };
 
     let children: Vec<&Note> = all.iter()
-        .filter(|n| n.id() != id && n.id().is_direct_child_of(id)
-            && (superseded.is_empty() || !superseded.contains(n.id())))
+        .filter(|n| n.id() != id && n.id().is_direct_child_of(id))
         .copied()
         .collect();
     let last = children.len().saturating_sub(1);
@@ -406,6 +377,21 @@ fn save_zk(zk: &NoteBox) {
     });
 }
 
+/// Returns the first line of content (the headline).
+fn headline(content: &str) -> &str {
+    content.lines().next().unwrap_or("")
+}
+
+/// Rejects single-line content longer than 150 characters.
+/// Multi-line notes (headline + body) are always accepted.
+fn validate_content(content: &str) {
+    if !content.contains('\n') && content.chars().count() > 150 {
+        eprintln!("error: content is a single line with more than 150 characters");
+        eprintln!("hint:  add a newline after the headline to include a longer body");
+        process::exit(1);
+    }
+}
+
 fn print_help() {
     println!("Usage: zk <command> [args]");
     println!();
@@ -422,7 +408,7 @@ fn print_help() {
     println!("  backlinks <id>          Notes that link to this note");
     println!("  search [--all] <query>  Case-insensitive search (skip superseded unless --all)");
     println!("  merge                   Auto-resolve git conflicts in draw files");
-    println!("  tree [--all-versions] [-d <depth>] [id]  Show subtree");
+    println!("  tree [-d <depth>] [id]  Show subtree (all notes; [outdated]/[v2] markers)");
     println!("  help                    Show this message");
     println!();
     println!("Environment:");
