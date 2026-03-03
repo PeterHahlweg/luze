@@ -983,7 +983,7 @@ mod tests {
 
     #[test]
     fn test_supersedes_field_roundtrip() {
-        let dir = std::env::temp_dir().join("zk_test_supersedes_rt");
+        let dir = std::env::temp_dir().join("luze_test_supersedes_rt");
         let _ = std::fs::remove_dir_all(&dir);
 
         let mut zk = NoteBox::create(&dir);
@@ -1084,7 +1084,7 @@ mod tests {
 
     #[test]
     fn test_save_open_roundtrip() {
-        let dir = std::env::temp_dir().join("zk_test_roundtrip");
+        let dir = std::env::temp_dir().join("luze_test_roundtrip");
         let _ = std::fs::remove_dir_all(&dir);
 
         let mut zk = NoteBox::create(&dir);

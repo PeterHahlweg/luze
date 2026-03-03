@@ -10,22 +10,22 @@ fn main() {
 
     match args[1].as_str() {
         "init" => {
-            let zk = NoteBox::create(zk_dir());
-            save_zk(&zk);
+            let notes = NoteBox::create(notes_dir());
+            save_notes(&notes);
         }
 
         "add" => {
             if args.len() < 4 {
-                eprintln!("error: usage: zk add <id> <content>");
+                eprintln!("error: usage: luze add <id> <content>");
                 process::exit(1);
             }
             let id = ID::from(args[2].as_str());
             let content = args[3..].join(" ");
             validate_content(&content);
-            let mut zk = load_zk();
+            let mut notes = load_notes();
             let parent = id.parent();
             if parent != id {
-                match zk.find(&parent) {
+                match notes.find(&parent) {
                     Ok(None) => {
                         eprintln!("error: parent {} not found", parent);
                         process::exit(1);
@@ -37,25 +37,25 @@ fn main() {
                     Ok(Some(_)) => {}
                 }
             }
-            if let Err(e) = zk.add(Note::new(id, parent, &content)) {
+            if let Err(e) = notes.add(Note::new(id, parent, &content)) {
                 eprintln!("error: {}", e);
                 process::exit(1);
             }
-            save_zk(&zk);
+            save_notes(&notes);
         }
 
         "update" => {
             if args.len() < 4 {
-                eprintln!("error: usage: zk update <id> <content>");
+                eprintln!("error: usage: luze update <id> <content>");
                 process::exit(1);
             }
             let id = ID::from(args[2].as_str());
             let content = args[3..].join(" ");
             validate_content(&content);
-            let mut zk = load_zk();
-            match zk.update(&id, &content) {
+            let mut notes = load_notes();
+            match notes.update(&id, &content) {
                 Ok(new_id) => {
-                    save_zk(&zk);
+                    save_notes(&notes);
                     println!("{} supersedes {}", new_id, id);
                 }
                 Err(e) => {
@@ -67,19 +67,19 @@ fn main() {
 
         "unlink" => {
             if args.len() < 4 {
-                eprintln!("error: usage: zk unlink <from> <to>");
+                eprintln!("error: usage: luze unlink <from> <to>");
                 process::exit(1);
             }
             let from = ID::from(args[2].as_str());
             let to   = ID::from(args[3].as_str());
-            let mut zk = load_zk();
-            match zk.find_mut(&from) {
+            let mut notes = load_notes();
+            match notes.find_mut(&from) {
                 Ok(Some(note)) => {
                     if !note.remove_link(&to) {
                         eprintln!("error: no link from {} to {}", from, to);
                         process::exit(1);
                     }
-                    save_zk(&zk);
+                    save_notes(&notes);
                 }
                 Ok(None) => {
                     eprintln!("error: note {} not found", from);
@@ -94,13 +94,13 @@ fn main() {
 
         "link" => {
             if args.len() < 4 {
-                eprintln!("error: usage: zk link <from> <to>");
+                eprintln!("error: usage: luze link <from> <to>");
                 process::exit(1);
             }
             let from = ID::from(args[2].as_str());
             let to   = ID::from(args[3].as_str());
-            let mut zk = load_zk();
-            match zk.find_mut(&from) {
+            let mut notes = load_notes();
+            match notes.find_mut(&from) {
                 Ok(Some(note)) => note.add_link(to),
                 Ok(None) => {
                     eprintln!("error: note {} not found", from);
@@ -111,15 +111,15 @@ fn main() {
                     process::exit(1);
                 }
             }
-            save_zk(&zk);
+            save_notes(&notes);
         }
 
         "list" => {
             let show_all = args.iter().any(|a| a == "--all");
-            let mut zk = load_zk();
-            zk.load_all().unwrap_or_else(|e| { eprintln!("error: {}", e); process::exit(1) });
-            let superseded: HashSet<&ID> = if show_all { HashSet::new() } else { zk.superseded_ids() };
-            for note in zk.notes() {
+            let mut notes = load_notes();
+            notes.load_all().unwrap_or_else(|e| { eprintln!("error: {}", e); process::exit(1) });
+            let superseded: HashSet<&ID> = if show_all { HashSet::new() } else { notes.superseded_ids() };
+            for note in notes.notes() {
                 if !show_all && superseded.contains(note.id()) { continue; }
                 println!("{:<6} {}", note.id(), headline(note.content()));
             }
@@ -127,13 +127,13 @@ fn main() {
 
         "show" => {
             if args.len() < 3 {
-                eprintln!("error: usage: zk show <id>");
+                eprintln!("error: usage: luze show <id>");
                 process::exit(1);
             }
             let id = ID::from(args[2].as_str());
-            let mut zk = load_zk();
-            zk.load_all().unwrap_or_else(|e| { eprintln!("error: {}", e); process::exit(1) });
-            match zk.find(&id) {
+            let mut notes = load_notes();
+            notes.load_all().unwrap_or_else(|e| { eprintln!("error: {}", e); process::exit(1) });
+            match notes.find(&id) {
                 Ok(Some(note)) => {
                     let note = note.clone();
                     println!("ID:      {}", note.id());
@@ -142,7 +142,7 @@ fn main() {
                     if let Some(sup) = note.supersedes() {
                         println!("Supersedes: {}", sup);
                     }
-                    if let Some(by) = zk.superseded_by(note.id()) {
+                    if let Some(by) = notes.superseded_by(note.id()) {
                         println!("Superseded by: {}", by);
                     }
                     let links = note.links();
@@ -164,12 +164,12 @@ fn main() {
 
         "children" => {
             if args.len() < 3 {
-                eprintln!("error: usage: zk children <id>");
+                eprintln!("error: usage: luze children <id>");
                 process::exit(1);
             }
             let id = ID::from(args[2].as_str());
-            let mut zk = load_zk();
-            let notes = zk.children(&id)
+            let mut notes = load_notes();
+            let notes = notes.children(&id)
                 .unwrap_or_else(|e| { eprintln!("error: {}", e); process::exit(1) });
             for note in notes {
                 println!("{:<6} {}", note.id(), headline(note.content()));
@@ -178,12 +178,12 @@ fn main() {
 
         "ancestors" => {
             if args.len() < 3 {
-                eprintln!("error: usage: zk ancestors <id>");
+                eprintln!("error: usage: luze ancestors <id>");
                 process::exit(1);
             }
             let id = ID::from(args[2].as_str());
-            let mut zk = load_zk();
-            let notes = zk.ancestors(&id)
+            let mut notes = load_notes();
+            let notes = notes.ancestors(&id)
                 .unwrap_or_else(|e| { eprintln!("error: {}", e); process::exit(1) });
             for note in &notes {
                 println!("{:<6} {}", note.id(), headline(note.content()));
@@ -192,12 +192,12 @@ fn main() {
 
         "backlinks" => {
             if args.len() < 3 {
-                eprintln!("error: usage: zk backlinks <id>");
+                eprintln!("error: usage: luze backlinks <id>");
                 process::exit(1);
             }
             let id = ID::from(args[2].as_str());
-            let mut zk = load_zk();
-            let notes = zk.backlinks(&id)
+            let mut notes = load_notes();
+            let notes = notes.backlinks(&id)
                 .unwrap_or_else(|e| { eprintln!("error: {}", e); process::exit(1) });
             for note in notes {
                 println!("{:<6} {}", note.id(), headline(note.content()));
@@ -206,18 +206,18 @@ fn main() {
 
         "search" => {
             if args.len() < 3 {
-                eprintln!("error: usage: zk search <query>");
+                eprintln!("error: usage: luze search <query>");
                 process::exit(1);
             }
             let show_all = args.iter().any(|a| a == "--all");
             let query: String = args[2..].iter()
                 .filter(|a| a.as_str() != "--all")
                 .cloned().collect::<Vec<_>>().join(" ");
-            let mut zk = load_zk();
+            let mut notes = load_notes();
             let notes = if show_all {
-                zk.search_all(&query)
+                notes.search_all(&query)
             } else {
-                zk.search(&query)
+                notes.search(&query)
             }.unwrap_or_else(|e| { eprintln!("error: {}", e); process::exit(1) });
             for note in notes {
                 println!("{:<6} {}", note.id(), headline(note.content()));
@@ -246,10 +246,10 @@ fn main() {
                 i += 1;
             }
 
-            let mut zk = load_zk();
-            zk.load_all().unwrap_or_else(|e| { eprintln!("error: {}", e); process::exit(1) });
-            let all_notes = zk.notes();
-            let superseded = zk.superseded_ids();
+            let mut notes = load_notes();
+            notes.load_all().unwrap_or_else(|e| { eprintln!("error: {}", e); process::exit(1) });
+            let all_notes = notes.notes();
+            let superseded = notes.superseded_ids();
 
             if let Some(ref id) = root_id {
                 if all_notes.iter().all(|n| n.id() != id) {
@@ -270,7 +270,7 @@ fn main() {
         }
 
         "merge" => {
-            match merge_conflicts(&zk_dir()) {
+            match merge_conflicts(&notes_dir()) {
                 Ok(reports) if reports.is_empty() => println!("no conflicts found"),
                 Ok(reports) => {
                     let mut conflicts: Vec<(&ID, &ID)> = Vec::new();
@@ -295,11 +295,11 @@ fn main() {
                         println!();
                         println!("semantic review required — both versions were kept but their");
                         println!("meaning cannot be checked automatically:");
-                        let mut zk = load_zk();
+                        let mut notes = load_notes();
                         for (orig, renamed) in &conflicts {
                             for (label, id) in [("head ", orig), ("their", renamed)] {
                                 print!("\n  [{}] {}", label, id);
-                                if let Ok(Some(note)) = zk.find(id) {
+                                if let Ok(Some(note)) = notes.find(id) {
                                     println!(" — {}", note.content());
                                 } else {
                                     println!();
@@ -358,20 +358,20 @@ fn print_tree(all: &[&Note], superseded: &HashSet<&ID>, id: &ID, depth: usize, m
     }
 }
 
-fn zk_dir() -> PathBuf {
-    env::var("ZK_PATH").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("./.zk"))
+fn notes_dir() -> PathBuf {
+    env::var("LUZE_PATH").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("./.luze"))
 }
 
-fn load_zk() -> NoteBox {
-    let dir = zk_dir();
+fn load_notes() -> NoteBox {
+    let dir = notes_dir();
     NoteBox::open(&dir).unwrap_or_else(|e| {
         eprintln!("error: could not open {}: {}", dir.display(), e);
         process::exit(1);
     })
 }
 
-fn save_zk(zk: &NoteBox) {
-    zk.save().unwrap_or_else(|e| {
+fn save_notes(notes: &NoteBox) {
+    notes.save().unwrap_or_else(|e| {
         eprintln!("error: could not save: {}", e);
         process::exit(1);
     });
@@ -410,10 +410,10 @@ fn print_help() {
     println!("150 chars for single-line notes). Use search to find entry points, then");
     println!("navigate with show, children, backlinks, and ancestors.");
     println!();
-    println!("Usage: zk <command> [args]");
+    println!("Usage: luze <command> [args]");
     println!();
     println!("Commands:");
-    println!("  init                    Create zk/draws/ directory");
+    println!("  init                    Create .luze/draws/ directory");
     println!("  add <id> <content>      Add a note; parent derived from ID");
     println!("  update <id> <content>   Create a new child note that supersedes <id>");
     println!("  link <from> <to>        Add a link from one note to another");
@@ -429,5 +429,5 @@ fn print_help() {
     println!("  help                    Show this message");
     println!();
     println!("Environment:");
-    println!("  ZK_PATH  Directory for the NoteBox (default: ./.zk)");
+    println!("  LUZE_PATH  Directory for the NoteBox (default: ./.luze)");
 }
