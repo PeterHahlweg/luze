@@ -38,6 +38,7 @@ fn cmd_init() {
 fn cmd_add(args: &[String]) {
     if args.len() < 4 {
         eprintln!("error: usage: luze add <id> <content>");
+        eprintln!("hint:  a note must be atomic and dense (max 250 chars)");
         process::exit(1);
     }
     let id = ID::from(args[2].as_str());
@@ -68,6 +69,7 @@ fn cmd_add(args: &[String]) {
 fn cmd_update(args: &[String]) {
     if args.len() < 4 {
         eprintln!("error: usage: luze update <id> <content>");
+        eprintln!("hint:  a note must be atomic and dense (max 250 chars)");
         process::exit(1);
     }
     let id = ID::from(args[2].as_str());
@@ -415,6 +417,9 @@ fn print_help() {
     println!("parts of the tree. Over time, you may write a note that ties a cluster");
     println!("together — not as a predefined category, but as a summary of structure");
     println!("that has already grown.");
+    println!();
+    println!("A note must be atomic — one indivisible thought, as dense as possible,");
+    println!("not exceeding 250 characters.");
     println!();
     println!("Notes have a hierarchical ID (e.g. 1a2b), immutable content, and links.");
     println!("New thoughts branch from existing notes; updates create a new child that");

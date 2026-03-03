@@ -16,6 +16,13 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, fmt, fs, io, path::{Path, PathBuf}};
 
+/// Maximum number of characters allowed in a note's content.
+///
+/// Notes must be atomic — one indivisible thought. 250 characters is enough
+/// for even a complex idea expressed precisely. Content is immutable once
+/// written, so this limit is enforced at construction time.
+pub const MAX_CONTENT_LEN: usize = 250;
+
 mod json {
     use serde::{Serialize, de::DeserializeOwned};
 
@@ -531,8 +538,15 @@ impl NoteBox {
             .collect())
     }
 
-    /// Inserts a note into its draw (lazy-loaded). Returns `Err` if the draw is full.
+    /// Inserts a note into its draw (lazy-loaded).
+    /// Returns `Err` if the content exceeds [`MAX_CONTENT_LEN`] or the draw is full.
     pub fn add(&mut self, z: Note) -> Result<(), String> {
+        if z.content.len() > MAX_CONTENT_LEN {
+            return Err(format!(
+                "note content exceeds {MAX_CONTENT_LEN} characters ({} chars): a note must express one atomic thought",
+                z.content.len()
+            ));
+        }
         let section = draw_section(&z.id).to_string();
         let di = match self.draw_idx(&section) {
             Ok(i)  => i,
