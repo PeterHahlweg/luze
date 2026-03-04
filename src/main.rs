@@ -95,6 +95,7 @@ fn cmd_add(args: &[String]) {
     }
     if let Err(e) = notes.add(Note::new(id, parent, &content)) {
         eprintln!("error: {}", e);
+        eprintln!("hint:  use 'luze update {} <content>' to create a new version", args[2]);
         process::exit(1);
     }
     save_notes(&notes);

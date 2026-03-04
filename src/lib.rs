@@ -557,7 +557,11 @@ impl NoteBox {
             let name = if section.is_empty() { "root" } else { &section };
             return Err(format!("draw '{name}' is full ({DRAW_CAPACITY})"));
         }
-        let pos = self.draws[di].notes.as_ref().unwrap().partition_point(|n| n.id < z.id);
+        let notes = self.draws[di].notes.as_ref().unwrap();
+        let pos = notes.partition_point(|n| n.id < z.id);
+        if notes.get(pos).map_or(false, |n| n.id == z.id) {
+            return Err(format!("note {} already exists", z.id));
+        }
         self.draws[di].notes.as_mut().unwrap().insert(pos, z);
         Ok(())
     }
@@ -924,6 +928,16 @@ mod tests {
         let notes = zk.notes();
         assert_eq!(notes[0].id, ID::from("1a"));
         assert_eq!(notes[1].id, ID::from("1a1"));
+    }
+
+    #[test]
+    fn test_add_rejects_duplicate_id() {
+        let mut zk = NoteBox::default();
+        zk.add(Note::new("1a", "1", "first")).unwrap();
+        let err = zk.add(Note::new("1a", "1", "second")).unwrap_err();
+        assert!(err.contains("already exists"), "unexpected error: {err}");
+        // only one note with that ID in the box
+        assert_eq!(zk.draws.iter().flat_map(|d| d.notes.as_deref().unwrap_or(&[])).filter(|n| n.id == ID::from("1a")).count(), 1);
     }
 
     #[test]
