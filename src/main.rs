@@ -433,6 +433,14 @@ fn has_uncommitted(dir: &Path) -> bool {
     git(dir, &["status", "--porcelain"]).map(|s| !s.is_empty()).unwrap_or(false)
 }
 
+fn current_branch(dir: &Path) -> Option<String> {
+    git(dir, &["rev-parse", "--abbrev-ref", "HEAD"]).ok().filter(|s| !s.is_empty() && s != "HEAD")
+}
+
+fn has_upstream(dir: &Path) -> bool {
+    git(dir, &["rev-parse", "--abbrev-ref", "@{u}"]).is_ok()
+}
+
 fn unpushed_count(dir: &Path) -> usize {
     git(dir, &["rev-list", "--count", "@{u}..HEAD"])
         .ok().and_then(|s| s.parse().ok()).unwrap_or(0)
@@ -475,8 +483,20 @@ fn cmd_sync(args: &[String]) {
         }
     }
 
-    // Step 2: pull
-    match git(&dir, &["pull"]) {
+    let branch = current_branch(&dir).unwrap_or_else(|| "main".to_string());
+    let tracking = has_upstream(&dir);
+
+    // Step 2: pull (skip if no upstream yet — first push will set it)
+    let pull_result = if tracking {
+        git(&dir, &["pull"])
+    } else {
+        // Try fetching the remote branch; if it doesn't exist yet, skip pull
+        match git(&dir, &["fetch", "origin", &branch]) {
+            Ok(_) => git(&dir, &["merge", &format!("origin/{}", branch)]),
+            Err(_) => Ok(String::new()), // remote branch doesn't exist yet
+        }
+    };
+    match pull_result {
         Ok(_) => {}
         Err(e) => {
             // Check if pull failed due to merge conflicts
@@ -518,8 +538,13 @@ fn cmd_sync(args: &[String]) {
         }
     }
 
-    // Step 3: push
-    if let Err(e) = git(&dir, &["push"]) {
+    // Step 3: push (set upstream on first push)
+    let push_result = if tracking {
+        git(&dir, &["push"])
+    } else {
+        git(&dir, &["push", "-u", "origin", &branch])
+    };
+    if let Err(e) = push_result {
         eprintln!("error: git push failed: {}", e);
         process::exit(1);
     }
