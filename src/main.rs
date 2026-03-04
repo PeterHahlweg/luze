@@ -513,7 +513,8 @@ fn cmd_sync(args: &[String]) {
                     let before_short = git(&dir, &["rev-parse", "--short", &head_before]).unwrap_or_default();
                     println!("{} update{}, {} -> {}", n, if n == 1 { "" } else { "s" }, before_short, head_after);
                 } else {
-                    println!("0 updates");
+                    let short = git(&dir, &["rev-parse", "--short", "HEAD"]).unwrap_or_default();
+                    println!("0 updates, {}", short);
                 }
             }
         }
