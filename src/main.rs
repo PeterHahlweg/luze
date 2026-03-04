@@ -9,7 +9,7 @@ fn main() {
     }
 
     match args[1].as_str() {
-        "init"      => cmd_init(),
+        "init"      => cmd_init(&args),
         "add"       => cmd_add(&args),
         "update"    => cmd_update(&args),
         "link"      => cmd_link(&args),
@@ -30,8 +30,19 @@ fn main() {
     }
 }
 
-fn cmd_init() {
-    let notes = NoteBox::create(notes_dir());
+fn cmd_init(args: &[String]) {
+    let global = args.iter().any(|a| a == "--global");
+    let dir = if global {
+        env::var("HOME").map(|h| PathBuf::from(h).join(".luze")).unwrap_or_else(|_| {
+            eprintln!("error: could not determine home directory");
+            process::exit(1);
+        })
+    } else if let Ok(p) = env::var("LUZE_PATH") {
+        PathBuf::from(p)
+    } else {
+        PathBuf::from("./.luze")
+    };
+    let notes = NoteBox::create(dir);
     save_notes(&notes);
 }
 
@@ -373,7 +384,14 @@ fn print_tree(all: &[&Note], superseded: &HashSet<&ID>, id: &ID, depth: usize, m
 }
 
 fn notes_dir() -> PathBuf {
-    env::var("LUZE_PATH").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("./.luze"))
+    if let Ok(p) = env::var("LUZE_PATH") {
+        return PathBuf::from(p);
+    }
+    let local = PathBuf::from("./.luze");
+    if local.is_dir() {
+        return local;
+    }
+    env::var("HOME").map(|h| PathBuf::from(h).join(".luze")).unwrap_or(local)
 }
 
 fn load_notes() -> NoteBox {
@@ -430,7 +448,7 @@ fn print_help() {
     println!("Usage: luze <command> [args]");
     println!();
     println!("Commands:");
-    println!("  init                    Create .luze/draws/ directory");
+    println!("  init [--global]          Create .luze/ (--global creates ~/.luze/)");
     println!("  add <id> <content>      Add a note; parent derived from ID");
     println!("  update <id> <content>   Create a new child note that supersedes <id>");
     println!("  link <from> <to>        Add a link from one note to another");
@@ -446,5 +464,6 @@ fn print_help() {
     println!("  help                    Show this message");
     println!();
     println!("Environment:");
-    println!("  LUZE_PATH  Directory for the NoteBox (default: ./.luze)");
+    println!("  LUZE_PATH  Directory for the NoteBox");
+    println!("             Resolved: LUZE_PATH > ./.luze (if exists) > ~/.luze");
 }
