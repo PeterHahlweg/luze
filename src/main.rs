@@ -493,6 +493,7 @@ fn cmd_sync(args: &[String]) {
     let tracking = has_upstream(&dir);
 
     // Step 2: pull (skip if no upstream yet — first push will set it)
+    let head_before = git(&dir, &["rev-parse", "HEAD"]).unwrap_or_default();
     let pull_result = if tracking {
         git(&dir, &["pull"])
     } else {
@@ -503,7 +504,19 @@ fn cmd_sync(args: &[String]) {
         }
     };
     match pull_result {
-        Ok(_) => {}
+        Ok(_) => {
+            if !head_before.is_empty() {
+                let n: usize = git(&dir, &["rev-list", "--count", &format!("{}..HEAD", head_before)])
+                    .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                if n > 0 {
+                    let head_after = git(&dir, &["rev-parse", "--short", "HEAD"]).unwrap_or_default();
+                    let before_short = git(&dir, &["rev-parse", "--short", &head_before]).unwrap_or_default();
+                    println!("{} update{}, {} -> {}", n, if n == 1 { "" } else { "s" }, before_short, head_after);
+                } else {
+                    println!("0 updates");
+                }
+            }
+        }
         Err(e) => {
             // Check if pull failed due to merge conflicts
             let status = git(&dir, &["status", "--porcelain"]);
