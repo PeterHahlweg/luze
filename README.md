@@ -1,22 +1,35 @@
 # luze
 
-A digital note box following Niklas Luhmann's Zettelkasten method.
+A digital Zettelkasten following Niklas Luhmann's method.
 
-Notes use Luhmann-style IDs (`1a1`, `1a2`, `1b`, ...) that encode their position in a tree. Content never gets overwritten — updates archive the old version as a child note. Notes are stored as JSON in per-drawer files, lazily loaded.
+Notes use Luhmann-style IDs (`1a1`, `1a2`, `1b`, ...) that encode their position in a branching tree. Notes are **immutable** — content is never overwritten. To refine a thought, use `update`, which creates a new child note that supersedes the original; existing children stay in place. Notes are stored as JSON in per-drawer files, lazily loaded.
 
 ## Usage
 
 ```
-zk init
-zk add 1 "First note"
-zk add 1a "A thought branching off"
-zk update 1 "Revised first note"
-zk tree
+luze init
+luze add 1 "First note"
+luze add 1a "A thought branching off"
+luze update 1 "A refined version of the first note"
+luze tree
+luze sync -m "refine thought"
 ```
 
-Set `ZK_PATH` to change the storage directory (default: `./.zk`).
+Set `LUZE_PATH` to change the storage directory (default: `./.luze`).
 
-Run `zk help` for all commands.
+Run `luze help` for all commands.
+
+## Sync
+
+`luze sync` lets multiple people share a Zettelkasten over a git remote. This command commits local work, pulls, resolves any conflicts, and pushes — no manual `git mergetool` needed.
+
+Conflicts in draw files are resolved automatically at the note level:
+
+- **Note exists only on one side** — added as-is.
+- **Same ID, same content, different links** — link lists are unioned.
+- **Same ID, different content** — two collaborators independently wrote a note at the same position. Both are kept; the local one is moved to the next available sibling ID.
+
+Because notes are immutable, the third case is stable after one sync: once both versions exist in the shared history, the same conflict will never recur.
 
 ## License
 
