@@ -1,4 +1,4 @@
-use std::{collections::HashSet, env, path::{Path, PathBuf}, process};
+use std::{collections::HashSet, env, io::Write, path::{Path, PathBuf}, process};
 use std::process::Command;
 use luze::{ID, Note, NoteBox, MergeAction, merge_conflicts, merge_conflicts_rename_head};
 
@@ -49,7 +49,20 @@ fn cmd_init(args: &[String]) {
     if !dir.join(".git").is_dir() && has_git() {
         let status = Command::new("git").args(["init"]).current_dir(&dir).status();
         match status {
-            Ok(s) if s.success() => {}
+            Ok(s) if s.success() => {
+                eprint!("git remote url (enter to skip): ");
+                std::io::stderr().flush().ok();
+                let mut remote = String::new();
+                if std::io::stdin().read_line(&mut remote).is_ok() {
+                    let remote = remote.trim();
+                    if !remote.is_empty() {
+                        match git(&dir, &["remote", "add", "origin", remote]) {
+                            Ok(_) => eprintln!("remote origin set to {}", remote),
+                            Err(e) => eprintln!("warning: git remote add failed: {}", e),
+                        }
+                    }
+                }
+            }
             Ok(s) => eprintln!("warning: git init exited with {}", s),
             Err(e) => eprintln!("warning: git init failed: {}", e),
         }
