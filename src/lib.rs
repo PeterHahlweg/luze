@@ -710,7 +710,7 @@ fn next_available_sibling(id: &ID, taken: &HashSet<ID>) -> ID {
     candidate
 }
 
-fn merge_note_vecs(head: Vec<Note>, theirs: Vec<Note>) -> (Vec<Note>, Vec<MergeAction>) {
+fn merge_note_vecs(head: Vec<Note>, theirs: Vec<Note>, rename_head: bool) -> (Vec<Note>, Vec<MergeAction>) {
     let mut merged = head;
     let mut actions = Vec::new();
     let mut taken: HashSet<ID> = merged.iter().map(|n| n.id().clone()).collect();
@@ -736,6 +736,15 @@ fn merge_note_vecs(head: Vec<Note>, theirs: Vec<Note>) -> (Vec<Note>, Vec<MergeA
                     }
                     if changed { actions.push(MergeAction::LinksMerged(id)); }
                     // else: identical — silently dedup
+                } else if rename_head {
+                    // Content conflict — keep theirs (upstream), rename head (ours).
+                    let original = merged[pos].id().clone();
+                    let new_id = next_available_sibling(&original, &taken);
+                    taken.insert(new_id.clone());
+                    actions.push(MergeAction::Renamed { original, renamed_to: new_id.clone() });
+                    let head_note = merged.remove(pos);
+                    merged.push(head_note.with_id(new_id));
+                    merged.push(their_note);
                 } else {
                     // Content conflict — keep head, rename theirs to next sibling.
                     let original = their_note.id().clone();
@@ -761,6 +770,14 @@ fn merge_note_vecs(head: Vec<Note>, theirs: Vec<Note>) -> (Vec<Note>, Vec<MergeA
 ///   the next available sibling ID so both are preserved.
 /// - One side removes a note the other kept → the kept version wins.
 pub fn merge_conflicts(dir: &Path) -> io::Result<Vec<MergeReport>> {
+    merge_conflicts_inner(dir, false)
+}
+
+pub fn merge_conflicts_rename_head(dir: &Path) -> io::Result<Vec<MergeReport>> {
+    merge_conflicts_inner(dir, true)
+}
+
+fn merge_conflicts_inner(dir: &Path, rename_head: bool) -> io::Result<Vec<MergeReport>> {
     let draws_dir = dir.join("draws");
     if !draws_dir.exists() { return Ok(Vec::new()); }
 
@@ -786,7 +803,7 @@ pub fn merge_conflicts(dir: &Path) -> io::Result<Vec<MergeReport>> {
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         let draw_id = if stem == "root" { ID(String::new()) } else { ID(stem.to_string()) };
 
-        let (resolved, actions) = merge_note_vecs(head_notes, theirs_notes);
+        let (resolved, actions) = merge_note_vecs(head_notes, theirs_notes, rename_head);
 
         let json = json::to_string_pretty(&resolved)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;

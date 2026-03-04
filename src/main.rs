@@ -1,5 +1,6 @@
-use std::{collections::HashSet, env, path::PathBuf, process};
-use luze::{ID, Note, NoteBox, MergeAction, merge_conflicts};
+use std::{collections::HashSet, env, path::{Path, PathBuf}, process};
+use std::process::Command;
+use luze::{ID, Note, NoteBox, MergeAction, merge_conflicts, merge_conflicts_rename_head};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -22,6 +23,7 @@ fn main() {
         "search"    => cmd_search(&args),
         "tree"      => cmd_tree(&args),
         "merge"     => cmd_merge(),
+        "sync"      => cmd_sync(&args),
         "help" | "--help" | "-h" => print_help(),
         cmd => {
             eprintln!("error: unknown command '{}'", cmd);
@@ -42,8 +44,16 @@ fn cmd_init(args: &[String]) {
     } else {
         PathBuf::from("./.luze")
     };
-    let notes = NoteBox::create(dir);
+    let notes = NoteBox::create(dir.clone());
     save_notes(&notes);
+    if !dir.join(".git").is_dir() && has_git() {
+        let status = Command::new("git").args(["init"]).current_dir(&dir).status();
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => eprintln!("warning: git init exited with {}", s),
+            Err(e) => eprintln!("warning: git init failed: {}", e),
+        }
+    }
 }
 
 fn cmd_add(args: &[String]) {
@@ -75,6 +85,7 @@ fn cmd_add(args: &[String]) {
         process::exit(1);
     }
     save_notes(&notes);
+    sync_hint();
 }
 
 fn cmd_update(args: &[String]) {
@@ -91,6 +102,7 @@ fn cmd_update(args: &[String]) {
         Ok(new_id) => {
             save_notes(&notes);
             println!("{} supersedes {}", new_id, id);
+            sync_hint();
         }
         Err(e) => {
             eprintln!("error: {}", e);
@@ -119,6 +131,7 @@ fn cmd_link(args: &[String]) {
         }
     }
     save_notes(&notes);
+    sync_hint();
 }
 
 fn cmd_unlink(args: &[String]) {
@@ -136,6 +149,7 @@ fn cmd_unlink(args: &[String]) {
                 process::exit(1);
             }
             save_notes(&notes);
+            sync_hint();
         }
         Ok(None) => {
             eprintln!("error: note {} not found", from);
@@ -383,6 +397,132 @@ fn print_tree(all: &[&Note], superseded: &HashSet<&ID>, id: &ID, depth: usize, m
     }
 }
 
+fn has_git() -> bool {
+    Command::new("git").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git").args(args).current_dir(dir).output()
+        .map_err(|e| format!("failed to run git: {}", e))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(stderr)
+    }
+}
+
+fn has_remote(dir: &Path) -> bool {
+    git(dir, &["remote"]).map(|s| !s.is_empty()).unwrap_or(false)
+}
+
+fn has_uncommitted(dir: &Path) -> bool {
+    git(dir, &["status", "--porcelain"]).map(|s| !s.is_empty()).unwrap_or(false)
+}
+
+fn unpushed_count(dir: &Path) -> usize {
+    git(dir, &["rev-list", "--count", "@{u}..HEAD"])
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(0)
+}
+
+fn cmd_sync(args: &[String]) {
+    let dir = notes_dir();
+    if !dir.join(".git").is_dir() {
+        eprintln!("error: {} is not a git repository", dir.display());
+        eprintln!("hint:  run 'luze init' to create one, or 'git init' inside {}", dir.display());
+        process::exit(1);
+    }
+    if !has_remote(&dir) {
+        eprintln!("error: no git remote configured");
+        eprintln!("hint:  run 'git -C {} remote add origin <url>'", dir.display());
+        process::exit(1);
+    }
+
+    // Optional commit message: luze sync -m "message"
+    let mut message = String::from("luze sync");
+    let mut i = 2;
+    while i < args.len() {
+        if args[i] == "-m" && i + 1 < args.len() {
+            message = args[i + 1].clone();
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+
+    // Step 1: commit local changes if any
+    if has_uncommitted(&dir) {
+        if let Err(e) = git(&dir, &["add", "-A"]) {
+            eprintln!("error: git add failed: {}", e);
+            process::exit(1);
+        }
+        if let Err(e) = git(&dir, &["commit", "-m", &message]) {
+            eprintln!("error: git commit failed: {}", e);
+            process::exit(1);
+        }
+    }
+
+    // Step 2: pull
+    match git(&dir, &["pull"]) {
+        Ok(_) => {}
+        Err(e) => {
+            // Check if pull failed due to merge conflicts
+            let status = git(&dir, &["status", "--porcelain"]);
+            let has_conflicts = status.as_ref().map(|s| s.contains("UU")).unwrap_or(false);
+            if has_conflicts {
+                // Run luze merge to resolve draw conflicts (rename ours, keep upstream)
+                match merge_conflicts_rename_head(&dir) {
+                    Ok(reports) if reports.is_empty() => {
+                        eprintln!("error: git pull failed with non-draw conflicts: {}", e);
+                        process::exit(1);
+                    }
+                    Ok(reports) => {
+                        for report in &reports {
+                            for action in &report.actions {
+                                if let MergeAction::Renamed { original, renamed_to } = action {
+                                    eprintln!("renamed local {} → {} (upstream kept original ID)", original, renamed_to);
+                                }
+                            }
+                        }
+                        if let Err(e) = git(&dir, &["add", "-A"]) {
+                            eprintln!("error: git add after merge failed: {}", e);
+                            process::exit(1);
+                        }
+                        if let Err(e) = git(&dir, &["commit", "-m", "luze sync: merge"]) {
+                            eprintln!("error: git commit after merge failed: {}", e);
+                            process::exit(1);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("error: merge failed: {}", e);
+                        process::exit(1);
+                    }
+                }
+            } else {
+                eprintln!("error: git pull failed: {}", e);
+                process::exit(1);
+            }
+        }
+    }
+
+    // Step 3: push
+    if let Err(e) = git(&dir, &["push"]) {
+        eprintln!("error: git push failed: {}", e);
+        process::exit(1);
+    }
+}
+
+fn sync_hint() {
+    let dir = notes_dir();
+    if !dir.join(".git").is_dir() || !has_remote(&dir) { return; }
+    let dirty = has_uncommitted(&dir);
+    let ahead = unpushed_count(&dir);
+    if dirty || ahead > 0 {
+        let n = ahead + if dirty { 1 } else { 0 };
+        eprintln!("hint: {} local change{} not synced. Run 'luze sync'", n, if n == 1 { "" } else { "s" });
+    }
+}
+
 fn notes_dir() -> PathBuf {
     if let Ok(p) = env::var("LUZE_PATH") {
         return PathBuf::from(p);
@@ -459,6 +599,7 @@ fn print_help() {
     println!("  ancestors <id>          Print breadcrumb path to a note");
     println!("  backlinks <id>          Notes that link to this note");
     println!("  search [--all] <query>  Case-insensitive search (skip superseded unless --all)");
+    println!("  sync [-m <msg>]          Commit, pull, merge, and push via git");
     println!("  merge                   Auto-resolve git conflicts in draw files");
     println!("  tree [-d <depth>] [id]  Show subtree (all notes; [outdated]/[v2] markers)");
     println!("  help                    Show this message");
