@@ -310,6 +310,34 @@ fn draw_file_path(draws_dir: &Path, id: &ID) -> PathBuf {
     draws_dir.join(format!("{}.json", draw_filename(id)))
 }
 
+/// Acquires an exclusive advisory lock on the lock file for the draw containing `id`.
+///
+/// Blocks until the lock becomes available. Returns a [`fs::File`] that holds
+/// the lock — dropping it releases the lock automatically. Use in write commands
+/// to prevent concurrent agents from corrupting the same draw file:
+///
+pub fn acquire_draw_lock(dir: &Path, id: &ID) -> io::Result<fs::File> {
+    let section = draw_section(id);
+    let stem = if section.is_empty() { "root" } else { section };
+    let lock_path = dir.join("draws").join(format!("{}.lock", stem));
+    fs::create_dir_all(dir.join("draws"))?;
+    let file = fs::OpenOptions::new().write(true).create(true).open(&lock_path)?;
+    flock_exclusive(&file)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn flock_exclusive(file: &fs::File) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    extern "C" { fn flock(fd: i32, operation: i32) -> i32; }
+    const LOCK_EX: i32 = 2;
+    let ret = unsafe { flock(file.as_raw_fd(), LOCK_EX) };
+    if ret == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+
+#[cfg(not(unix))]
+fn flock_exclusive(_file: &fs::File) -> io::Result<()> { Ok(()) }
+
 /// Maximum notes per draw. Reflects the physical capacity of a wooden drawer.
 pub const DRAW_CAPACITY: usize = 5_000;
 
@@ -410,7 +438,10 @@ impl NoteBox {
             if let Some(notes) = &draw.notes {
                 let json = json::to_string_pretty(notes)
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-                fs::write(draw_file_path(&draws_dir, &draw.id), json)?;
+                let dest = draw_file_path(&draws_dir, &draw.id);
+                let tmp  = dest.with_extension("tmp");
+                fs::write(&tmp, json)?;
+                fs::rename(&tmp, &dest)?;
             }
         }
         Ok(())
@@ -792,6 +823,12 @@ fn merge_conflicts_inner(dir: &Path, rename_head: bool) -> io::Result<Vec<MergeR
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") { continue; }
 
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let lock_path = draws_dir.join(format!("{}.lock", stem));
+        let lock_file = fs::OpenOptions::new().write(true).create(true).open(&lock_path)?;
+        flock_exclusive(&lock_file)?;
+        let _lock = lock_file;
+
         let content = fs::read_to_string(&path)?;
         if !has_conflict_markers(&content) { continue; }
 
@@ -804,14 +841,15 @@ fn merge_conflicts_inner(dir: &Path, rename_head: bool) -> io::Result<Vec<MergeR
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData,
                 format!("{}: their side: {}", path.display(), e)))?;
 
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         let draw_id = if stem == "root" { ID(String::new()) } else { ID(stem.to_string()) };
 
         let (resolved, actions) = merge_note_vecs(head_notes, theirs_notes, rename_head);
 
         let json = json::to_string_pretty(&resolved)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        fs::write(&path, json)?;
+        let tmp = path.with_extension("tmp");
+        fs::write(&tmp, json)?;
+        fs::rename(&tmp, &path)?;
 
         reports.push(MergeReport { draw: draw_id, actions });
     }
@@ -1290,6 +1328,132 @@ mod tests {
     }
 
     // --- File-based round-trip ---
+
+    #[test]
+    fn test_acquire_draw_lock_same_draw_serializes() {
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        let dir = std::env::temp_dir().join("luze_test_draw_lock");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("draws")).unwrap();
+
+        let id = ID::from("1a/1");
+        let order: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // Acquire the lock on the main thread.
+        let lock = acquire_draw_lock(&dir, &id).unwrap();
+        order.lock().unwrap().push(1);
+
+        let dir2 = dir.clone();
+        let order2 = order.clone();
+        let handle = thread::spawn(move || {
+            // This blocks until the main thread releases.
+            let _l = acquire_draw_lock(&dir2, &id).unwrap();
+            order2.lock().unwrap().push(2);
+        });
+
+        // Small yield to let the spawned thread reach flock() and block.
+        thread::sleep(std::time::Duration::from_millis(50));
+        drop(lock); // release — unblocks the thread
+        handle.join().unwrap();
+
+        assert_eq!(*order.lock().unwrap(), vec![1, 2]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_acquire_draw_lock_different_draws_do_not_block() {
+        use std::thread;
+
+        let dir = std::env::temp_dir().join("luze_test_draw_lock_parallel");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("draws")).unwrap();
+
+        let id_a = ID::from("1a/1");
+        let id_b = ID::from("1b/1");
+
+        let lock_a = acquire_draw_lock(&dir, &id_a).unwrap();
+
+        let dir2 = dir.clone();
+        // Different draw — must not block even though 1a is held.
+        let handle = thread::spawn(move || {
+            acquire_draw_lock(&dir2, &id_b).unwrap();
+        });
+        handle.join().unwrap(); // would hang if draws shared a lock
+
+        drop(lock_a);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_atomic_write_no_tmp_left_after_save() {
+        let dir = std::env::temp_dir().join("luze_test_atomic_notmp");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut zk = NoteBox::create(&dir);
+        zk.add(Note::new("1a/1", "1a/1", "alpha")).unwrap();
+        zk.save().unwrap();
+
+        let tmp_files: Vec<_> = std::fs::read_dir(dir.join("draws")).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("tmp"))
+            .collect();
+        assert!(tmp_files.is_empty(), "tmp files left after save: {:?}", tmp_files);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_atomic_write_reader_sees_valid_json() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        use std::thread;
+
+        let dir = std::env::temp_dir().join("luze_test_atomic_reader");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Seed with an initial draw so the reader has a file to open.
+        let mut zk = NoteBox::create(&dir);
+        zk.add(Note::new("1a/1", "1a/1", "seed")).unwrap();
+        zk.save().unwrap();
+
+        let draw_path = dir.join("draws").join("1a.json");
+        let done = Arc::new(AtomicBool::new(false));
+
+        // Writer: repeatedly save a growing draw.
+        let dir_w = dir.clone();
+        let done_w = done.clone();
+        let writer = thread::spawn(move || {
+            let mut zk = NoteBox::open(&dir_w).unwrap();
+            zk.load_all().unwrap();
+            for i in 0..200u32 {
+                let id   = format!("1a/{}", i + 2);
+                let cont = format!("note number {}", i);
+                let _ = zk.add(Note::new(id.as_str(), "1a/1", &cont));
+                zk.save().unwrap();
+            }
+            done_w.store(true, Ordering::Release);
+        });
+
+        // Reader: read the draw file while the writer is active; must always be valid JSON.
+        let reader = thread::spawn(move || {
+            while !done.load(Ordering::Acquire) {
+                if let Ok(bytes) = std::fs::read(&draw_path) {
+                    let s = String::from_utf8_lossy(&bytes);
+                    if !s.is_empty() {
+                        assert!(
+                            json::from_str::<Vec<Note>>(&s).is_ok(),
+                            "reader saw invalid JSON: {}", &s[..s.len().min(120)]
+                        );
+                    }
+                }
+            }
+        });
+
+        writer.join().unwrap();
+        reader.join().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn test_save_open_roundtrip() {

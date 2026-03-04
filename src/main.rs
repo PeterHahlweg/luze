@@ -1,7 +1,7 @@
 use std::{collections::HashSet, env, io::Write, path::PathBuf, process};
 use luze::{
     ID, Note, NoteBox, MergeAction, merge_conflicts,
-    notes_dir, headline, validate_content,
+    notes_dir, headline, validate_content, acquire_draw_lock,
     git_available, git_run, git_remote, git_has_uncommitted, git_unpushed_count,
     sync,
 };
@@ -83,6 +83,9 @@ fn cmd_add(args: &[String]) {
         eprintln!("error: {}", e);
         process::exit(1);
     }
+    let _lock = acquire_draw_lock(&notes_dir(), &id).unwrap_or_else(|e| {
+        eprintln!("error: could not lock draw: {}", e); process::exit(1)
+    });
     let mut notes = load_notes();
     let parent = id.parent();
     if parent != id {
@@ -119,6 +122,9 @@ fn cmd_update(args: &[String]) {
         eprintln!("error: {}", e);
         process::exit(1);
     }
+    let _lock = acquire_draw_lock(&notes_dir(), &id).unwrap_or_else(|e| {
+        eprintln!("error: could not lock draw: {}", e); process::exit(1)
+    });
     let mut notes = load_notes();
     match notes.update(&id, &content) {
         Ok(new_id) => {
@@ -140,6 +146,9 @@ fn cmd_link(args: &[String]) {
     }
     let from = ID::from(args[2].as_str());
     let to   = ID::from(args[3].as_str());
+    let _lock = acquire_draw_lock(&notes_dir(), &from).unwrap_or_else(|e| {
+        eprintln!("error: could not lock draw: {}", e); process::exit(1)
+    });
     let mut notes = load_notes();
     match notes.find_mut(&from) {
         Ok(Some(note)) => note.add_link(to),
@@ -163,6 +172,9 @@ fn cmd_unlink(args: &[String]) {
     }
     let from = ID::from(args[2].as_str());
     let to   = ID::from(args[3].as_str());
+    let _lock = acquire_draw_lock(&notes_dir(), &from).unwrap_or_else(|e| {
+        eprintln!("error: could not lock draw: {}", e); process::exit(1)
+    });
     let mut notes = load_notes();
     match notes.find_mut(&from) {
         Ok(Some(note)) => {
