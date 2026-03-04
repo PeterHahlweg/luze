@@ -425,8 +425,10 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
-fn has_remote(dir: &Path) -> bool {
-    git(dir, &["remote"]).map(|s| !s.is_empty()).unwrap_or(false)
+fn first_remote(dir: &Path) -> Option<String> {
+    git(dir, &["remote"]).ok()
+        .and_then(|s| s.lines().next().map(|l| l.to_string()))
+        .filter(|s| !s.is_empty())
 }
 
 fn has_uncommitted(dir: &Path) -> bool {
@@ -453,11 +455,14 @@ fn cmd_sync(args: &[String]) {
         eprintln!("hint:  run 'luze init' to create one, or 'git init' inside {}", dir.display());
         process::exit(1);
     }
-    if !has_remote(&dir) {
-        eprintln!("error: no git remote configured");
-        eprintln!("hint:  run 'git -C {} remote add origin <url>'", dir.display());
-        process::exit(1);
-    }
+    let remote = match first_remote(&dir) {
+        Some(r) => r,
+        None => {
+            eprintln!("error: no git remote configured");
+            eprintln!("hint:  run 'git -C {} remote add origin <url>'", dir.display());
+            process::exit(1);
+        }
+    };
 
     // Optional commit message: luze sync -m "message"
     let mut message = String::from("luze sync");
@@ -491,8 +496,8 @@ fn cmd_sync(args: &[String]) {
         git(&dir, &["pull"])
     } else {
         // Try fetching the remote branch; if it doesn't exist yet, skip pull
-        match git(&dir, &["fetch", "origin", &branch]) {
-            Ok(_) => git(&dir, &["merge", &format!("origin/{}", branch)]),
+        match git(&dir, &["fetch", &remote, &branch]) {
+            Ok(_) => git(&dir, &["merge", &format!("{}/{}", remote, branch)]),
             Err(_) => Ok(String::new()), // remote branch doesn't exist yet
         }
     };
@@ -542,7 +547,7 @@ fn cmd_sync(args: &[String]) {
     let push_result = if tracking {
         git(&dir, &["push"])
     } else {
-        git(&dir, &["push", "-u", "origin", &branch])
+        git(&dir, &["push", "-u", &remote, &branch])
     };
     if let Err(e) = push_result {
         eprintln!("error: git push failed: {}", e);
@@ -552,7 +557,7 @@ fn cmd_sync(args: &[String]) {
 
 fn sync_hint() {
     let dir = notes_dir();
-    if !dir.join(".git").is_dir() || !has_remote(&dir) { return; }
+    if !dir.join(".git").is_dir() || first_remote(&dir).is_none() { return; }
     let dirty = has_uncommitted(&dir);
     let ahead = unpushed_count(&dir);
     if dirty || ahead > 0 {
