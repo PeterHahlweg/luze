@@ -301,9 +301,9 @@ fn draw_section(id: &ID) -> &str {
 }
 
 /// Converts a draw ID to a filename stem.
-/// Root draw (`""`) → `"root"`. Others are single Luhmann segments with no `/`.
+/// Root draw (`""`) → `"1a"`. Others are single Luhmann segments with no `/`.
 pub fn draw_filename(id: &ID) -> String {
-    if id.0.is_empty() { "root".into() } else { id.0.clone() }
+    if id.0.is_empty() { "1a".into() } else { id.0.clone() }
 }
 
 fn draw_file_path(draws_dir: &Path, id: &ID) -> PathBuf {
