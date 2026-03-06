@@ -1,7 +1,7 @@
 use std::{collections::HashSet, env, io::Write, path::PathBuf, process};
 use luze::{
-    ID, Note, NoteBox, MergeAction, merge_conflicts,
-    notes_dir, headline, validate_content, acquire_draw_lock,
+    ID, Note, NoteBox, MergeAction, merge_conflicts, migrate, needs_migration,
+    notes_dir, headline, validate_content, acquire_write_lock,
     git_available, git_run, git_remote, git_has_uncommitted, git_unpushed_count,
     sync,
 };
@@ -27,6 +27,7 @@ fn main() {
         "search"    => cmd_search(&args),
         "tree"      => cmd_tree(&args),
         "merge"     => cmd_merge(),
+        "migrate"   => cmd_migrate(),
         "sync"      => cmd_sync(&args),
         "help" | "--help" | "-h" => print_help(),
         cmd => {
@@ -83,8 +84,8 @@ fn cmd_add(args: &[String]) {
         eprintln!("error: {}", e);
         process::exit(1);
     }
-    let _lock = acquire_draw_lock(&notes_dir(), &id).unwrap_or_else(|e| {
-        eprintln!("error: could not lock draw: {}", e); process::exit(1)
+    let _lock = acquire_write_lock(&notes_dir()).unwrap_or_else(|e| {
+        eprintln!("error: could not acquire write lock: {}", e); process::exit(1)
     });
     let mut notes = load_notes();
     let parent = id.parent();
@@ -122,8 +123,8 @@ fn cmd_update(args: &[String]) {
         eprintln!("error: {}", e);
         process::exit(1);
     }
-    let _lock = acquire_draw_lock(&notes_dir(), &id).unwrap_or_else(|e| {
-        eprintln!("error: could not lock draw: {}", e); process::exit(1)
+    let _lock = acquire_write_lock(&notes_dir()).unwrap_or_else(|e| {
+        eprintln!("error: could not acquire write lock: {}", e); process::exit(1)
     });
     let mut notes = load_notes();
     match notes.update(&id, &content) {
@@ -146,8 +147,8 @@ fn cmd_link(args: &[String]) {
     }
     let from = ID::from(args[2].as_str());
     let to   = ID::from(args[3].as_str());
-    let _lock = acquire_draw_lock(&notes_dir(), &from).unwrap_or_else(|e| {
-        eprintln!("error: could not lock draw: {}", e); process::exit(1)
+    let _lock = acquire_write_lock(&notes_dir()).unwrap_or_else(|e| {
+        eprintln!("error: could not acquire write lock: {}", e); process::exit(1)
     });
     let mut notes = load_notes();
     match notes.find_mut(&from) {
@@ -172,8 +173,8 @@ fn cmd_unlink(args: &[String]) {
     }
     let from = ID::from(args[2].as_str());
     let to   = ID::from(args[3].as_str());
-    let _lock = acquire_draw_lock(&notes_dir(), &from).unwrap_or_else(|e| {
-        eprintln!("error: could not lock draw: {}", e); process::exit(1)
+    let _lock = acquire_write_lock(&notes_dir()).unwrap_or_else(|e| {
+        eprintln!("error: could not acquire write lock: {}", e); process::exit(1)
     });
     let mut notes = load_notes();
     match notes.find_mut(&from) {
@@ -422,12 +423,24 @@ fn print_tree(all: &[&Note], superseded: &HashSet<&ID>, id: &ID, depth: usize, m
     };
 
     let children: Vec<&Note> = all.iter()
-        .filter(|n| n.id() != id && n.id().is_direct_child_of(id))
+        .filter(|n| n.id().is_direct_child_of(id))
         .copied()
         .collect();
     let last = children.len().saturating_sub(1);
     for (i, child) in children.iter().enumerate() {
         print_tree(all, superseded, child.id(), depth + 1, max_depth, &child_prefix, i == last);
+    }
+}
+
+fn cmd_migrate() {
+    let dir = notes_dir();
+    if !needs_migration(&dir) {
+        println!("nothing to migrate — NoteBox is already in the current format.");
+        return;
+    }
+    match migrate(&dir) {
+        Ok(n) => println!("migrated {} note{}.", n, if n == 1 { "" } else { "s" }),
+        Err(e) => { eprintln!("error: migration failed: {}", e); process::exit(1); }
     }
 }
 
@@ -478,6 +491,11 @@ fn sync_hint() {
 
 fn load_notes() -> NoteBox {
     let dir = notes_dir();
+    if needs_migration(&dir) {
+        eprintln!("error: NoteBox at {} uses the old draw format.", dir.display());
+        eprintln!("hint:  run 'luze migrate' to convert it to the new format.");
+        process::exit(1);
+    }
     NoteBox::open(&dir).unwrap_or_else(|e| {
         eprintln!("error: could not open {}: {}", dir.display(), e);
         process::exit(1);
@@ -529,6 +547,7 @@ fn print_help() {
     println!("  search [--all] <query>  Case-insensitive search (skip superseded unless --all)");
     println!("  sync [-m <msg>]          Commit, pull, merge, and push via git");
     println!("  merge                   Auto-resolve git conflicts in draw files");
+    println!("  migrate                 Convert old-format NoteBox to current format");
     println!("  tree [-d <depth>] [id]  Show subtree (all notes; [outdated]/[v2] markers)");
     println!("  help                    Show this message");
     println!();
