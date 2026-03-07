@@ -377,7 +377,9 @@ impl NoteBox {
         }
 
         let child_id = self.first_available_child(id)?;
-        let note = Note::new_version(child_id.clone(), id.clone(), new_content, id.clone());
+        let cross_links: Vec<ID> = self.find(id)?.unwrap().links()[1..].to_vec();
+        let mut note = Note::new_version(child_id.clone(), id.clone(), new_content, id.clone());
+        for link in cross_links { note.add_link(link); }
         self.add(note).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         Ok(child_id)
     }

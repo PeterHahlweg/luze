@@ -585,6 +585,23 @@ mod tests {
         assert!(ancestors.is_empty());
     }
 
+    // --- update preserves cross-links ---
+
+    #[test]
+    fn test_update_preserves_cross_links() {
+        let mut zk = NoteBox::default();
+        zk.add(Note::new("1a", "1", "original")).unwrap();
+        // add cross-links to the original
+        zk.find_mut(&ID::from("1a")).unwrap().unwrap().add_link(ID::from("2"));
+        zk.find_mut(&ID::from("1a")).unwrap().unwrap().add_link(ID::from("3"));
+
+        let child_id = zk.update(&ID::from("1a"), "updated").unwrap();
+        let child = zk.find(&child_id).unwrap().unwrap();
+
+        assert_eq!(child.links(), &[ID::from("1a"), ID::from("2"), ID::from("3")],
+            "update should copy cross-links from the superseded note");
+    }
+
     // --- NoteBox::superseded_by ---
 
     #[test]
