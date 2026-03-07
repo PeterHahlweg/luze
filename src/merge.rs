@@ -1,6 +1,6 @@
 use std::{collections::{HashMap, HashSet}, fs, io, path::Path};
 
-use crate::{Note, ID, json, acquire_lock_file};
+use crate::{Note, ID, json, lock::acquire_lock_file};
 
 /// One auto-resolved action taken during [`merge_conflicts`].
 pub enum MergeAction {
