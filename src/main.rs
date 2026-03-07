@@ -19,6 +19,9 @@ fn main() {
         "update"    => cmd_update(&args),
         "link"      => cmd_link(&args),
         "unlink"    => cmd_unlink(&args),
+        "tag"       => cmd_tag(&args),
+        "untag"     => cmd_untag(&args),
+        "tagged"    => cmd_tagged(&args),
         "list"      => cmd_list(&args),
         "show"      => cmd_show(&args),
         "children"  => cmd_children(&args),
@@ -197,6 +200,59 @@ fn cmd_unlink(args: &[String]) {
     }
 }
 
+fn cmd_tag(args: &[String]) {
+    if args.len() < 4 {
+        eprintln!("error: usage: luze tag <id> <tag>");
+        process::exit(1);
+    }
+    let id  = ID::from(args[2].as_str());
+    let tag = &args[3];
+    let _lock = acquire_write_lock(&notes_dir()).unwrap_or_else(|e| {
+        eprintln!("error: could not acquire write lock: {}", e); process::exit(1)
+    });
+    let mut notes = load_notes();
+    if let Err(e) = notes.tag(&id, tag) {
+        eprintln!("error: {}", e);
+        process::exit(1);
+    }
+    save_notes(&notes);
+    sync_hint();
+}
+
+fn cmd_untag(args: &[String]) {
+    if args.len() < 4 {
+        eprintln!("error: usage: luze untag <id> <tag>");
+        process::exit(1);
+    }
+    let id  = ID::from(args[2].as_str());
+    let tag = &args[3];
+    let _lock = acquire_write_lock(&notes_dir()).unwrap_or_else(|e| {
+        eprintln!("error: could not acquire write lock: {}", e); process::exit(1)
+    });
+    let mut notes = load_notes();
+    if let Err(e) = notes.untag(&id, tag) {
+        eprintln!("error: {}", e);
+        process::exit(1);
+    }
+    save_notes(&notes);
+    sync_hint();
+}
+
+fn cmd_tagged(args: &[String]) {
+    if args.len() < 3 {
+        eprintln!("error: usage: luze tagged <tag>");
+        process::exit(1);
+    }
+    let tag = &args[2];
+    let mut notes = load_notes();
+    let results = notes.tagged(tag).unwrap_or_else(|e| {
+        eprintln!("error: {}", e); process::exit(1)
+    });
+    for note in results {
+        println!("{:<6} {}", note.id(), headline(note.content()));
+    }
+}
+
 fn cmd_list(args: &[String]) {
     let show_all = args.iter().any(|a| a == "--all");
     let mut notes = load_notes();
@@ -227,6 +283,10 @@ fn cmd_show(args: &[String]) {
             }
             if let Some(by) = notes.superseded_by(note.id()) {
                 println!("Superseded by: {}", by);
+            }
+            let tags = note.tags();
+            if !tags.is_empty() {
+                println!("Tags:    {}", tags.join(", "));
             }
             let links = note.links();
             if !links.is_empty() {
@@ -365,8 +425,8 @@ fn cmd_merge() {
                     match action {
                         MergeAction::Added(id) =>
                             println!("  added   {}", id),
-                        MergeAction::LinksMerged(id) =>
-                            println!("  links   {} (merged)", id),
+                        MergeAction::Merged(id) =>
+                            println!("  merged  {} (links/tags unioned)", id),
                         MergeAction::Renamed { original, renamed_to } => {
                             println!("  renamed {} → {}", original, renamed_to);
                             conflicts.push((original, renamed_to));
@@ -539,6 +599,9 @@ fn print_help() {
     println!("  update <id> <content>   Create a new child note that supersedes <id>");
     println!("  link <from> <to>        Add a link from one note to another");
     println!("  unlink <from> <to>      Remove a link between two notes");
+    println!("  tag <id> <tag>          Add a tag to a note (# prefix optional)");
+    println!("  untag <id> <tag>        Remove a tag from a note");
+    println!("  tagged <tag>            List notes that have a given tag");
     println!("  list [--all]            Print all notes (skip superseded unless --all)");
     println!("  show <id>               Print full content + links + version info");
     println!("  children <id>           List direct children of a note");

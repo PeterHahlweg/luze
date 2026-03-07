@@ -282,7 +282,7 @@ impl NoteBox {
     ///
     /// - Letter-ending IDs (e.g. `1c`): tries `1c1`, `1c2`, …
     /// - Digit-ending IDs (e.g. `1a1`): tries `1a1a`, `1a1b`, …
-    fn first_available_child(&mut self, id: &ID) -> io::Result<ID> {
+    pub fn first_available_child(&mut self, id: &ID) -> io::Result<ID> {
         let s = id.0.clone();
         if s.as_bytes().last().map_or(false, |b| b.is_ascii_digit()) {
             for c in b'a'..=b'z' {
@@ -359,6 +359,36 @@ impl NoteBox {
         Ok(results)
     }
 
+    /// Adds a tag to note `id`. Returns `Err` if the note is not found.
+    pub fn tag(&mut self, id: &ID, tag: &str) -> io::Result<()> {
+        match self.find_mut(id)? {
+            Some(note) => { note.add_tag(tag); Ok(()) }
+            None => Err(io::Error::new(io::ErrorKind::NotFound, format!("note {} not found", id))),
+        }
+    }
+
+    /// Removes a tag from note `id`. Returns `Err` if the note or tag is not found.
+    pub fn untag(&mut self, id: &ID, tag: &str) -> io::Result<()> {
+        match self.find_mut(id)? {
+            Some(note) => {
+                if note.remove_tag(tag) { Ok(()) }
+                else { Err(io::Error::new(io::ErrorKind::NotFound,
+                    format!("tag '{}' not found on {}", tag, id))) }
+            }
+            None => Err(io::Error::new(io::ErrorKind::NotFound, format!("note {} not found", id))),
+        }
+    }
+
+    /// Returns all loaded notes that have the given tag. Loads all draws first.
+    pub fn tagged(&mut self, tag: &str) -> io::Result<Vec<&Note>> {
+        self.load_all()?;
+        let t = tag.trim_start_matches('#').to_lowercase();
+        Ok(self.draws.values()
+            .flat_map(|d| d.notes.as_ref().unwrap().iter())
+            .filter(|n| n.tags().contains(&t))
+            .collect())
+    }
+
     /// Creates a new child note that supersedes `id`.
     /// Returns the new note's ID, or an error if:
     /// - `id` doesn't exist
@@ -377,9 +407,12 @@ impl NoteBox {
         }
 
         let child_id = self.first_available_child(id)?;
-        let cross_links: Vec<ID> = self.find(id)?.unwrap().links()[1..].to_vec();
+        let original = self.find(id)?.unwrap();
+        let cross_links: Vec<ID> = original.links()[1..].to_vec();
+        let old_tags: Vec<String> = original.tags().to_vec();
         let mut note = Note::new_version(child_id.clone(), id.clone(), new_content, id.clone());
         for link in cross_links { note.add_link(link); }
+        for tag in old_tags { note.add_tag(&tag); }
         self.add(note).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         Ok(child_id)
     }

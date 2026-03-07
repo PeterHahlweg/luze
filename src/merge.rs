@@ -6,8 +6,8 @@ use crate::{Note, ID, json, lock::acquire_lock_file};
 pub enum MergeAction {
     /// Note existed only in the incoming branch; added without conflict.
     Added(ID),
-    /// Same content on both sides; link lists were unioned.
-    LinksMerged(ID),
+    /// Same content on both sides; link lists and tag sets were unioned.
+    Merged(ID),
     /// Content conflict: their version was renamed to preserve both.
     Renamed { original: ID, renamed_to: ID },
 }
@@ -74,7 +74,7 @@ fn merge_note_vecs(head: Vec<Note>, theirs: Vec<Note>, rename_head: bool) -> (Ve
             }
             Some(pos) => {
                 if merged[pos].content() == their_note.content() {
-                    // Same content; union the non-parent links.
+                    // Same content; union non-parent links and tags.
                     let id = their_note.id().clone();
                     let mut changed = false;
                     for link in their_note.links().iter().skip(1) {
@@ -83,8 +83,15 @@ fn merge_note_vecs(head: Vec<Note>, theirs: Vec<Note>, rename_head: bool) -> (Ve
                             changed = true;
                         }
                     }
-                    if changed { actions.push(MergeAction::LinksMerged(id)); }
+                    for tag in their_note.tags() {
+                        if !merged[pos].tags().contains(tag) {
+                            merged[pos].add_tag(tag);
+                            changed = true;
+                        }
+                    }
+                    if changed { actions.push(MergeAction::Merged(id)); }
                     // else: identical — silently dedup
+
                 } else if rename_head {
                     // Content conflict — keep theirs (upstream), rename head (ours).
                     let original = merged[pos].id().clone();
@@ -268,7 +275,32 @@ mod tests {
         let (merged, actions) = merge_note_vecs(vec![head_note], vec![their_note], false);
         assert_eq!(merged.len(), 1);
         assert!(merged[0].links().contains(&ID::from("3")));
-        assert!(matches!(&actions[0], MergeAction::LinksMerged(id) if id == &ID::from("1")));
+        assert!(matches!(&actions[0], MergeAction::Merged(id) if id == &ID::from("1")));
+    }
+
+    #[test]
+    fn test_merge_note_vecs_same_content_unions_tags() {
+        let mut head_note = Note::new("1", "1", "same");
+        head_note.add_tag("rust");
+        let mut their_note = Note::new("1", "1", "same");
+        their_note.add_tag("zig");
+
+        let (merged, actions) = merge_note_vecs(vec![head_note], vec![their_note], false);
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0].tags().contains(&"rust".to_string()));
+        assert!(merged[0].tags().contains(&"zig".to_string()));
+        assert!(matches!(&actions[0], MergeAction::Merged(id) if id == &ID::from("1")));
+    }
+
+    #[test]
+    fn test_merge_note_vecs_same_content_same_tags_no_action() {
+        let mut head_note = Note::new("1", "1", "same");
+        head_note.add_tag("rust");
+        let mut their_note = Note::new("1", "1", "same");
+        their_note.add_tag("rust");
+
+        let (_, actions) = merge_note_vecs(vec![head_note], vec![their_note], false);
+        assert!(actions.is_empty());
     }
 
     #[test]

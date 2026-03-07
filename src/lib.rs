@@ -585,6 +585,105 @@ mod tests {
         assert!(ancestors.is_empty());
     }
 
+    // --- tags ---
+
+    #[test]
+    fn test_tag_adds_tag_to_note() {
+        let mut zk = NoteBox::default();
+        zk.add(Note::new("1a", "1", "content")).unwrap();
+        zk.tag(&ID::from("1a"), "rust").unwrap();
+        let note = zk.find(&ID::from("1a")).unwrap().unwrap();
+        assert!(note.tags().contains(&"rust".to_string()));
+    }
+
+    #[test]
+    fn test_tag_normalises_hash_prefix() {
+        let mut zk = NoteBox::default();
+        zk.add(Note::new("1a", "1", "content")).unwrap();
+        zk.tag(&ID::from("1a"), "#Rust").unwrap();
+        let note = zk.find(&ID::from("1a")).unwrap().unwrap();
+        assert_eq!(note.tags(), &["rust"]);
+    }
+
+    #[test]
+    fn test_tag_note_not_found() {
+        let mut zk = NoteBox::default();
+        assert!(zk.tag(&ID::from("99"), "rust").is_err());
+    }
+
+    #[test]
+    fn test_untag_removes_tag() {
+        let mut zk = NoteBox::default();
+        zk.add(Note::new("1a", "1", "content")).unwrap();
+        zk.tag(&ID::from("1a"), "rust").unwrap();
+        zk.untag(&ID::from("1a"), "rust").unwrap();
+        let note = zk.find(&ID::from("1a")).unwrap().unwrap();
+        assert!(note.tags().is_empty());
+    }
+
+    #[test]
+    fn test_untag_missing_tag_returns_err() {
+        let mut zk = NoteBox::default();
+        zk.add(Note::new("1a", "1", "content")).unwrap();
+        assert!(zk.untag(&ID::from("1a"), "rust").is_err());
+    }
+
+    #[test]
+    fn test_tagged_returns_notes_with_tag() {
+        let mut zk = NoteBox::default();
+        zk.add(Note::new("1a", "1", "note a")).unwrap();
+        zk.add(Note::new("1b", "1", "note b")).unwrap();
+        zk.add(Note::new("1c", "1", "note c")).unwrap();
+        zk.tag(&ID::from("1a"), "rust").unwrap();
+        zk.tag(&ID::from("1c"), "rust").unwrap();
+
+        let results = zk.tagged("rust").unwrap();
+        let ids: Vec<&ID> = results.iter().map(|n| n.id()).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&&ID::from("1a")));
+        assert!(ids.contains(&&ID::from("1c")));
+    }
+
+    #[test]
+    fn test_tagged_hash_prefix_normalised() {
+        let mut zk = NoteBox::default();
+        zk.add(Note::new("1a", "1", "content")).unwrap();
+        zk.tag(&ID::from("1a"), "rust").unwrap();
+
+        let results = zk.tagged("#rust").unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_tags_roundtrip() {
+        let dir = std::env::temp_dir().join("luze_test_tags_roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut zk = NoteBox::create(&dir);
+        zk.add(Note::new("1a", "1", "content")).unwrap();
+        zk.tag(&ID::from("1a"), "rust").unwrap();
+        zk.tag(&ID::from("1a"), "zig").unwrap();
+        zk.save().unwrap();
+
+        let mut loaded = NoteBox::open(&dir).unwrap();
+        let note = loaded.find(&ID::from("1a")).unwrap().unwrap();
+        assert_eq!(note.tags(), &["rust", "zig"]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_update_copies_tags() {
+        let mut zk = NoteBox::default();
+        zk.add(Note::new("1a", "1", "original")).unwrap();
+        zk.tag(&ID::from("1a"), "rust").unwrap();
+        zk.tag(&ID::from("1a"), "zig").unwrap();
+
+        let child_id = zk.update(&ID::from("1a"), "updated").unwrap();
+        let child = zk.find(&child_id).unwrap().unwrap();
+        assert_eq!(child.tags(), &["rust", "zig"]);
+    }
+
     // --- update preserves cross-links ---
 
     #[test]
