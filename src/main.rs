@@ -1,6 +1,6 @@
 use std::{collections::HashSet, env, io::Write, path::PathBuf, process};
 use luze::{
-    ID, Note, NoteBox, MergeAction, merge_conflicts, migrate, needs_migration, repair_stale_links,
+    ID, Note, NoteBox, MergeAction, merge_conflicts, migrate, needs_migration, repair_stale_links, repair_root_links,
     notes_dir, headline, validate_content, acquire_write_lock,
     git_available, git_run, git_remote, git_has_uncommitted, git_unpushed_count,
     sync,
@@ -402,7 +402,7 @@ fn cmd_tree(args: &[String]) {
         print_tree(&all_notes, &superseded, id, 0, max_depth, "", true);
     } else {
         let roots: Vec<&Note> = all_notes.iter()
-            .filter(|n| n.parent().map_or(false, |p| p == n.id()))
+            .filter(|n| n.parent().map_or(true, |p| p == n.id()))
             .copied()
             .collect();
         let last = roots.len().saturating_sub(1);
@@ -510,11 +510,17 @@ fn cmd_migrate() {
         Err(e) => { eprintln!("error: link repair failed: {}", e); process::exit(1); }
     };
 
-    if format_n == 0 && repair_n == 0 {
+    let root_n = match repair_root_links(&dir) {
+        Ok(n) => n,
+        Err(e) => { eprintln!("error: root link repair failed: {}", e); process::exit(1); }
+    };
+
+    if format_n == 0 && repair_n == 0 && root_n == 0 {
         println!("nothing to migrate.");
     } else {
         if format_n > 0 { println!("migrated {} note{}.", format_n, if format_n == 1 { "" } else { "s" }); }
         if repair_n > 0 { println!("repaired {} stale link{}.", repair_n, if repair_n == 1 { "" } else { "s" }); }
+        if root_n > 0 { println!("removed {} self-referencing root link{}.", root_n, if root_n == 1 { "" } else { "s" }); }
     }
 }
 

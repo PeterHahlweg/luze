@@ -476,6 +476,32 @@ pub fn repair_stale_links(dir: &Path) -> io::Result<usize> {
     Ok(count)
 }
 
+/// Strips self-referencing parent links from root notes.
+///
+/// Root notes were historically stored with `links[0] == self.id`. This
+/// removes that redundant self-reference so `note.parent()` returns `None`
+/// for true roots. Returns the number of notes repaired.
+pub fn repair_root_links(dir: &Path) -> io::Result<usize> {
+    let mut zk = NoteBox::open(dir)?;
+    zk.load_all()?;
+
+    let to_repair: Vec<ID> = zk.draws.values()
+        .flat_map(|d| d.notes.as_deref().unwrap_or(&[]).iter())
+        .filter(|n| n.links.first() == Some(&n.id))
+        .map(|n| n.id.clone())
+        .collect();
+
+    let count = to_repair.len();
+    for id in to_repair {
+        if let Ok(Some(note)) = zk.find_mut(&id) {
+            note.links.remove(0);
+        }
+    }
+
+    if count > 0 { zk.save()?; }
+    Ok(count)
+}
+
 /// Returns `true` if `dir` contains an old-format NoteBox that needs migration
 /// (a `draws/` subdirectory exists but `index.json` does not).
 pub fn needs_migration(dir: &Path) -> bool {

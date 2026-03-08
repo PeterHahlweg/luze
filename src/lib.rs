@@ -31,7 +31,7 @@ pub mod lock;
 pub use lock::{WriteLock, acquire_write_lock};
 
 pub mod store;
-pub use store::{Draw, DRAW_CAPACITY, NoteBox, needs_migration, migrate, repair_stale_links};
+pub use store::{Draw, DRAW_CAPACITY, NoteBox, needs_migration, migrate, repair_stale_links, repair_root_links};
 
 pub(crate) mod json {
     use serde::{Serialize, de::DeserializeOwned};
@@ -524,6 +524,70 @@ mod tests {
         let note = zk2.find(&ID::from("5b")).unwrap().unwrap();
         assert!(note.links().contains(&ID::from("1a1a")), "should link to chain tip");
         assert!(note.links().contains(&ID::from("o1a")), "should preserve original");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- repair_root_links ---
+
+    #[test]
+    fn test_repair_root_links_removes_self_reference() {
+        let dir = std::env::temp_dir().join("luze_test_repair_root");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Simulate old-format root notes with self-referencing parent link.
+        let mut zk = NoteBox::create(&dir);
+        zk.add(Note::new("1", "1", "root")).unwrap();
+        zk.add(Note::new("1a", "1", "child")).unwrap();
+        zk.save().unwrap();
+
+        let repaired = repair_root_links(&dir).unwrap();
+        assert_eq!(repaired, 1, "only the root note should be repaired");
+
+        let mut zk2 = NoteBox::open(&dir).unwrap();
+        let root = zk2.find(&ID::from("1")).unwrap().unwrap();
+        assert!(root.parent().is_none(), "root should have no parent after repair");
+
+        let child = zk2.find(&ID::from("1a")).unwrap().unwrap();
+        assert_eq!(child.parent(), Some(&ID::from("1")), "child parent should be unchanged");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_repair_root_links_noop_when_already_clean() {
+        let dir = std::env::temp_dir().join("luze_test_repair_root_noop");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut zk = NoteBox::create(&dir);
+        zk.add(Note::new("1a", "1", "child only")).unwrap();
+        zk.save().unwrap();
+
+        let repaired = repair_root_links(&dir).unwrap();
+        assert_eq!(repaired, 0);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_repair_root_links_tree_finds_roots_after_repair() {
+        let dir = std::env::temp_dir().join("luze_test_repair_root_tree");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut zk = NoteBox::create(&dir);
+        zk.add(Note::new("1", "1", "root a")).unwrap();
+        zk.add(Note::new("2", "2", "root b")).unwrap();
+        zk.add(Note::new("1a", "1", "child")).unwrap();
+        zk.save().unwrap();
+
+        repair_root_links(&dir).unwrap();
+
+        let mut zk2 = NoteBox::open(&dir).unwrap();
+        zk2.load_all().unwrap();
+        let roots: Vec<_> = zk2.notes().into_iter()
+            .filter(|n| n.parent().map_or(true, |p| p == n.id()))
+            .collect();
+        assert_eq!(roots.len(), 2, "should find exactly 2 roots");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
