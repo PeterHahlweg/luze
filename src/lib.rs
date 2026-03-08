@@ -798,6 +798,23 @@ mod tests {
         assert_eq!(child.tags(), &["rust", "zig"]);
     }
 
+    // --- update does not panic on notes with empty links ---
+
+    #[test]
+    fn test_update_does_not_panic_when_note_has_no_links() {
+        // Simulates a root note after repair_root_links removed its self-referencing
+        // parent link, leaving links: []. Calling update on any other note scans all
+        // notes including the link-less root — store.rs must not index into links[1..].
+        let mut zk = NoteBox::default();
+        zk.add(Note::new("1a", "1", "original")).unwrap();
+        zk.add(Note::new("2",  "2", "root with self-link")).unwrap();
+        // Simulate post-repair state: clear all links on the root note.
+        zk.find_mut(&ID::from("2")).unwrap().unwrap().links.clear();
+
+        // Must not panic.
+        zk.update(&ID::from("1a"), "updated").unwrap();
+    }
+
     // --- update preserves cross-links ---
 
     #[test]

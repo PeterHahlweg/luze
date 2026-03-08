@@ -408,7 +408,7 @@ impl NoteBox {
 
         let child_id = self.first_available_child(id)?;
         let original = self.find(id)?.unwrap();
-        let cross_links: Vec<ID> = original.links()[1..].to_vec();
+        let cross_links: Vec<ID> = original.links().get(1..).unwrap_or_default().to_vec();
         let old_tags: Vec<String> = original.tags().to_vec();
         let mut note = Note::new_version(child_id.clone(), id.clone(), new_content, id.clone());
         for link in cross_links { note.add_link(link); }
@@ -419,7 +419,7 @@ impl NoteBox {
         // and add child_id as the new active link, unless id was itself auto-inserted.
         let to_relink: Vec<ID> = self.draws.values()
             .flat_map(|d| d.notes.as_deref().unwrap_or(&[]).iter())
-            .filter(|n| n.id != *id && n.id != child_id && n.links[1..].contains(id))
+            .filter(|n| n.id != *id && n.id != child_id && n.links.get(1..).unwrap_or_default().contains(id))
             .map(|n| n.id.clone())
             .collect();
         for nid in to_relink {
@@ -458,7 +458,7 @@ pub fn repair_stale_links(dir: &Path) -> io::Result<usize> {
     let to_repair: Vec<(ID, ID, ID)> = zk.draws.values()
         .flat_map(|d| d.notes.as_deref().unwrap_or(&[]).iter())
         .flat_map(|n| {
-            n.links[1..].iter()
+            n.links.get(1..).unwrap_or_default().iter()
                 .filter(|l| !l.0.starts_with('o') && successors.contains_key(*l))
                 .map(|l| (n.id.clone(), l.clone(), tip_of(l)))
                 .collect::<Vec<_>>()
