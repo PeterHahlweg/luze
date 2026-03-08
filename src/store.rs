@@ -414,8 +414,66 @@ impl NoteBox {
         for link in cross_links { note.add_link(link); }
         for tag in old_tags { note.add_tag(&tag); }
         self.add(note).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        // Redirect inbound cross-links in all other notes: rename id→oid (original)
+        // and add child_id as the new active link, unless id was itself auto-inserted.
+        let to_relink: Vec<ID> = self.draws.values()
+            .flat_map(|d| d.notes.as_deref().unwrap_or(&[]).iter())
+            .filter(|n| n.id != *id && n.id != child_id && n.links[1..].contains(id))
+            .map(|n| n.id.clone())
+            .collect();
+        for nid in to_relink {
+            if let Ok(Some(note)) = self.find_mut(&nid) {
+                note.redirect_cross_link(id, child_id.clone());
+            }
+        }
+
         Ok(child_id)
     }
+}
+
+/// Repairs stale inbound cross-links caused by updates that predate the `o`-prefix redirect.
+///
+/// Scans all notes for cross-links pointing to superseded notes, follows each chain to its
+/// current tip, and applies `redirect_cross_link` (treating all as user-set, since they
+/// predate automatic redirection). Returns the number of links repaired.
+pub fn repair_stale_links(dir: &Path) -> io::Result<usize> {
+    let mut zk = NoteBox::open(dir)?;
+    zk.load_all()?;
+
+    // Build successor map: superseded_id -> the note that supersedes it.
+    let successors: HashMap<ID, ID> = zk.draws.values()
+        .flat_map(|d| d.notes.as_deref().unwrap_or(&[]).iter())
+        .filter_map(|n| n.supersedes.as_ref().map(|s| (s.clone(), n.id.clone())))
+        .collect();
+
+    // Follow the chain from `start` to the current tip.
+    let tip_of = |start: &ID| -> ID {
+        let mut cur = start.clone();
+        while let Some(next) = successors.get(&cur) { cur = next.clone(); }
+        cur
+    };
+
+    // Collect (note_id, stale_link, tip) for every cross-link pointing to a superseded note.
+    let to_repair: Vec<(ID, ID, ID)> = zk.draws.values()
+        .flat_map(|d| d.notes.as_deref().unwrap_or(&[]).iter())
+        .flat_map(|n| {
+            n.links[1..].iter()
+                .filter(|l| !l.0.starts_with('o') && successors.contains_key(*l))
+                .map(|l| (n.id.clone(), l.clone(), tip_of(l)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    let count = to_repair.len();
+    for (note_id, stale, tip) in to_repair {
+        if let Ok(Some(note)) = zk.find_mut(&note_id) {
+            note.redirect_cross_link(&stale, tip);
+        }
+    }
+
+    if count > 0 { zk.save()?; }
+    Ok(count)
 }
 
 /// Returns `true` if `dir` contains an old-format NoteBox that needs migration

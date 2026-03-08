@@ -31,7 +31,7 @@ pub mod lock;
 pub use lock::{WriteLock, acquire_write_lock};
 
 pub mod store;
-pub use store::{Draw, DRAW_CAPACITY, NoteBox, needs_migration, migrate};
+pub use store::{Draw, DRAW_CAPACITY, NoteBox, needs_migration, migrate, repair_stale_links};
 
 pub(crate) mod json {
     use serde::{Serialize, de::DeserializeOwned};
@@ -478,6 +478,56 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    // --- repair_stale_links ---
+
+    #[test]
+    fn test_repair_stale_links_redirects_existing_link() {
+        let dir = std::env::temp_dir().join("luze_test_repair_stale");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut zk = NoteBox::create(&dir);
+        zk.add(Note::new("1a", "1", "original")).unwrap();
+        zk.add(Note::new("5b", "5", "references")).unwrap();
+        zk.find_mut(&ID::from("5b")).unwrap().unwrap().add_link(ID::from("1a"));
+        // manually supersede 1a with 1a1 without going through update (simulates old data)
+        zk.add(Note::new_version("1a1", "1a", "updated", "1a")).unwrap();
+        zk.save().unwrap();
+
+        let repaired = repair_stale_links(&dir).unwrap();
+        assert_eq!(repaired, 1);
+
+        let mut zk2 = NoteBox::open(&dir).unwrap();
+        let note = zk2.find(&ID::from("5b")).unwrap().unwrap();
+        assert!(note.links().contains(&ID::from("1a1")), "should link to current version");
+        assert!(note.links().contains(&ID::from("o1a")), "should preserve original link");
+        assert!(!note.links().contains(&ID::from("1a")), "bare stale link should be gone");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_repair_stale_links_follows_chain_to_tip() {
+        let dir = std::env::temp_dir().join("luze_test_repair_chain");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut zk = NoteBox::create(&dir);
+        zk.add(Note::new("1a", "1", "v1")).unwrap();
+        zk.add(Note::new("5b", "5", "references")).unwrap();
+        zk.find_mut(&ID::from("5b")).unwrap().unwrap().add_link(ID::from("1a"));
+        zk.add(Note::new_version("1a1", "1a", "v2", "1a")).unwrap();
+        zk.add(Note::new_version("1a1a", "1a1", "v3", "1a1")).unwrap();
+        zk.save().unwrap();
+
+        repair_stale_links(&dir).unwrap();
+
+        let mut zk2 = NoteBox::open(&dir).unwrap();
+        let note = zk2.find(&ID::from("5b")).unwrap().unwrap();
+        assert!(note.links().contains(&ID::from("1a1a")), "should link to chain tip");
+        assert!(note.links().contains(&ID::from("o1a")), "should preserve original");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     // --- validate_content ---
 
     #[test]
@@ -718,6 +768,65 @@ mod tests {
         zk.add(Note::new("1", "1", "original")).unwrap();
         zk.load_all().unwrap();
         assert_eq!(zk.superseded_by(&ID::from("1")), None);
+    }
+
+    // --- inbound cross-link redirection on update ---
+
+    #[test]
+    fn test_update_redirects_inbound_cross_links() {
+        // 5b cross-links to 1a; after update, 5b should get oX original + new active link
+        let mut zk = NoteBox::default();
+        zk.add(Note::new("1a", "1", "original")).unwrap();
+        zk.add(Note::new("5b", "5", "references")).unwrap();
+        zk.find_mut(&ID::from("5b")).unwrap().unwrap().add_link(ID::from("1a"));
+
+        let new_id = zk.update(&ID::from("1a"), "updated").unwrap();
+        let referencing = zk.find(&ID::from("5b")).unwrap().unwrap();
+
+        assert!(referencing.links().contains(&new_id),
+            "active link should point to new version");
+        assert!(referencing.links().contains(&ID::from("o1a")),
+            "original link should be preserved with o prefix");
+        assert!(!referencing.links().contains(&ID::from("1a")),
+            "bare old link should be gone");
+    }
+
+    #[test]
+    fn test_update_chain_does_not_double_mark_original() {
+        // 5b links to 1a; 1a→1a1, then 1a1→1a1a.
+        // After both updates, 5b should still only have o1a as original, not o1a1.
+        let mut zk = NoteBox::default();
+        zk.add(Note::new("1a", "1", "v1")).unwrap();
+        zk.add(Note::new("5b", "5", "references")).unwrap();
+        zk.find_mut(&ID::from("5b")).unwrap().unwrap().add_link(ID::from("1a"));
+
+        zk.update(&ID::from("1a"), "v2").unwrap();  // 1a1 added to 5b; o1a marked
+        zk.update(&ID::from("1a1"), "v3").unwrap(); // 1a1a replaces 1a1; no new o mark
+
+        let referencing = zk.find(&ID::from("5b")).unwrap().unwrap();
+        assert!(referencing.links().contains(&ID::from("1a1a")),
+            "active link should be at tip of chain");
+        assert!(referencing.links().contains(&ID::from("o1a")),
+            "original user link should be preserved");
+        assert!(!referencing.links().contains(&ID::from("o1a1")),
+            "intermediate auto link should not be marked as original");
+    }
+
+    #[test]
+    fn test_update_user_link_to_child_treated_as_original() {
+        // User explicitly linked to 1a1 (not via auto-redirect).
+        // When 1a1 is superseded, it should be marked o1a1 since no oW ancestor exists.
+        let mut zk = NoteBox::default();
+        zk.add(Note::new("1a", "1", "v1")).unwrap();
+        zk.add(Note::new("1a1", "1a", "v2")).unwrap();
+        zk.add(Note::new("5b", "5", "references")).unwrap();
+        zk.find_mut(&ID::from("5b")).unwrap().unwrap().add_link(ID::from("1a1"));
+
+        zk.update(&ID::from("1a1"), "v3").unwrap();
+
+        let referencing = zk.find(&ID::from("5b")).unwrap().unwrap();
+        assert!(referencing.links().contains(&ID::from("o1a1")),
+            "user's explicit link to 1a1 should be marked as original");
     }
 
 }

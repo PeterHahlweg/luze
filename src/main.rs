@@ -1,6 +1,6 @@
 use std::{collections::HashSet, env, io::Write, path::PathBuf, process};
 use luze::{
-    ID, Note, NoteBox, MergeAction, merge_conflicts, migrate, needs_migration,
+    ID, Note, NoteBox, MergeAction, merge_conflicts, migrate, needs_migration, repair_stale_links,
     notes_dir, headline, validate_content, acquire_write_lock,
     git_available, git_run, git_remote, git_has_uncommitted, git_unpushed_count,
     sync,
@@ -494,13 +494,27 @@ fn print_tree(all: &[&Note], superseded: &HashSet<&ID>, id: &ID, depth: usize, m
 
 fn cmd_migrate() {
     let dir = notes_dir();
-    if !needs_migration(&dir) {
-        println!("nothing to migrate — NoteBox is already in the current format.");
-        return;
-    }
-    match migrate(&dir) {
-        Ok(n) => println!("migrated {} note{}.", n, if n == 1 { "" } else { "s" }),
-        Err(e) => { eprintln!("error: migration failed: {}", e); process::exit(1); }
+    let _lock = acquire_write_lock(&dir).unwrap_or_else(|e| {
+        eprintln!("error: could not acquire write lock: {}", e); process::exit(1)
+    });
+
+    let format_n = if needs_migration(&dir) {
+        match migrate(&dir) {
+            Ok(n) => n,
+            Err(e) => { eprintln!("error: migration failed: {}", e); process::exit(1); }
+        }
+    } else { 0 };
+
+    let repair_n = match repair_stale_links(&dir) {
+        Ok(n) => n,
+        Err(e) => { eprintln!("error: link repair failed: {}", e); process::exit(1); }
+    };
+
+    if format_n == 0 && repair_n == 0 {
+        println!("nothing to migrate.");
+    } else {
+        if format_n > 0 { println!("migrated {} note{}.", format_n, if format_n == 1 { "" } else { "s" }); }
+        if repair_n > 0 { println!("repaired {} stale link{}.", repair_n, if repair_n == 1 { "" } else { "s" }); }
     }
 }
 

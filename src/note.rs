@@ -94,6 +94,38 @@ impl Note {
     /// Returns a clone of this note with a different ID.
     pub fn with_id(mut self, id: impl Into<ID>) -> Self { self.id = id.into(); self }
 
+    /// Redirects an inbound cross-link when the target note is superseded.
+    ///
+    /// If `old` appears in `links[1..]` and is a user-set link (no `o`-prefixed ancestor
+    /// exists in the current links), it is renamed to `o<old>` and `new` is added.
+    /// If `old` is an auto-inserted link (an `o`-prefixed ancestor is already present
+    /// whose un-prefixed ID is a prefix of `old`), it is simply replaced with `new`.
+    ///
+    /// Returns `true` if any change was made.
+    pub fn redirect_cross_link(&mut self, old: &ID, new: ID) -> bool {
+        let pos = match self.links[1..].iter().position(|l| l == old) {
+            Some(i) => i + 1,
+            None => return false,
+        };
+        let old_str = old.0.as_str();
+        let has_o_ancestor = self.links[1..].iter().any(|l| {
+            if let Some(orig) = l.0.strip_prefix('o') {
+                old_str.starts_with(orig)
+            } else {
+                false
+            }
+        });
+        if has_o_ancestor {
+            // auto-inserted link — just replace
+            self.links[pos] = new;
+        } else {
+            // user-set link — mark original, add active
+            self.links[pos] = ID(format!("o{}", old_str));
+            self.links.push(new);
+        }
+        true
+    }
+
     /// Removes the first occurrence of `id` from links. Returns `true` if found.
     pub fn remove_link(&mut self, id: &ID) -> bool {
         if let Some(pos) = self.links.iter().position(|l| l == id) {
